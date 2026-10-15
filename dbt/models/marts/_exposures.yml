@@ -1,0 +1,37 @@
+version: 2
+
+exposures:
+  - name: live_commerce_dashboard
+    label: "Live Commerce — Airtime Intelligence Dashboard"
+    type: dashboard
+    maturity: high
+    # Declaring the BI tool as a dbt exposure puts the dashboard INTO the lineage graph:
+    # sources -> staging -> intermediate -> marts -> this dashboard. dbt can then warn
+    # if a change would break a model the dashboard depends on, and `dbt build -s
+    # +exposure:live_commerce_dashboard` builds exactly what the dashboard needs.
+    url: https://app.powerbi.com/  # replace with the published report URL once deployed
+    description: >
+      Self-service Power BI dashboard for live-commerce performance: revenue per
+      broadcast minute, conversion lift during airtime, and return-rate intelligence by
+      presenter, product and channel. Consumes ONLY the governed marts (never staging or
+      raw), so every figure traces to a single tested KPI definition.
+
+    # The marts the dashboard reads. These are the dependency edges shown in lineage.
+    depends_on:
+      - ref('mart_kpi_metrics')
+      - ref('mart_segment_performance')
+      - ref('mart_conversion_windows')
+      - ref('dim_product')
+      - ref('dim_presenter')
+      - ref('dim_channel')
+      - ref('dim_show')
+      - ref('dim_date')
+      - ref('dim_time_minute')
+      - ref('fact_order_line')
+      - ref('fact_airtime_segment')
+      - ref('fact_returns')
+      - ref('fact_traffic')
+
+    owner:
+      name: Analytics
+      email: analytics@example.com

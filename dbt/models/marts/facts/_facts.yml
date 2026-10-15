@@ -1,0 +1,159 @@
+version: 2
+
+models:
+  - name: fact_order_line
+    description: >
+      GRAIN: one row per product line per order. The high-volume fact (incremental,
+      merge on order_line_id with a lookback re-attribution window). Transaction price
+      and monetary measures live here, not in any dimension.
+    columns:
+      - name: order_line_id
+        description: Degenerate key — natural grain of the fact.
+        data_tests: [not_null, unique]
+      - name: order_id
+        data_tests: [not_null]
+      - name: product_key
+        description: Point-in-time surrogate FK to dim_product (version valid at event time).
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: channel_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_channel')
+                field: channel_key
+      - name: attributed_segment_id
+        description: FK to fact_airtime_segment.segment_id, or -1 for organic/baseline.
+        data_tests: [not_null]
+      - name: quantity
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: net_amount
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: is_airtime_attributed
+        data_tests: [not_null]
+
+  - name: fact_airtime_segment
+    description: >
+      GRAIN: one row per broadcast segment (a product featured in one continuous on-air
+      window). Measure: segment_duration_minutes (denominator for revenue-per-minute).
+    columns:
+      - name: segment_id
+        data_tests: [not_null, unique]
+      - name: daypart
+        description: Daypart derived from the segment's start hour.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [morning, afternoon, prime_time, late_night]
+      - name: is_prime_time
+        data_tests: [not_null]
+      - name: product_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: presenter_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_presenter')
+                field: presenter_key
+      - name: show_key
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_show')
+                field: show_key
+      - name: channel_key
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_channel')
+                field: channel_key
+      - name: segment_duration_minutes
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+
+  - name: fact_returns
+    description: "GRAIN: one row per returned order line. Measures: returned_qty, refund_amount."
+    columns:
+      - name: return_id
+        data_tests: [not_null, unique]
+      - name: order_line_id
+        description: FK to fact_order_line (every return points at a real sold line).
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fact_order_line')
+                field: order_line_id
+      - name: product_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: returned_qty
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: refund_amount
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: fact_traffic
+    description: >
+      GRAIN: one row per channel per minute. Measures: concurrent_viewers, web_sessions.
+      The conversion denominator.
+    columns:
+      - name: channel_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_channel')
+                field: channel_key
+      - name: minute_ts_utc
+        data_tests: [not_null]
+      - name: web_sessions
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [channel_id, minute_ts_utc]

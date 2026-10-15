@@ -1,0 +1,42 @@
+[sqlfluff]
+# Snowflake dialect; templated through dbt so ref()/source()/macros resolve.
+dialect = snowflake
+templater = dbt
+# Models, snapshots, singular tests, and the analysis SQL.
+exclude_rules = RF04, ST06, AM04
+max_line_length = 120
+
+[sqlfluff:indentation]
+tab_space_size = 4
+indent_unit = space
+
+[sqlfluff:templater:dbt]
+project_dir = dbt
+profiles_dir = dbt
+
+[sqlfluff:layout:type:comma]
+spacing_before = touch
+line_position = trailing
+
+# Keywords lowercase, identifiers as written — house style for this repo.
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:references.special_chars]
+allow_space_in_identifier = False
+
+[sqlfluff:rules:convention.terminator]
+multiline_newline = True
+require_final_semicolon = False

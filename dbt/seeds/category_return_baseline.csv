@@ -1,0 +1,7 @@
+category,return_baseline_rate,is_heavy_returner
+Fashion,0.28,true
+Jewellery,0.24,true
+Beauty,0.10,false
+Home & Living,0.08,false
+Electronics,0.06,false
+Wellness,0.07,false

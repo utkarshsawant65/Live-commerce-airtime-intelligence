@@ -1,0 +1,57 @@
+name: 'live_commerce'
+version: '1.0.0'
+config-version: 2
+
+# This profile is defined in profiles.yml (see profiles.example.yml). It points at
+# the WH_TRANSFORM warehouse via ROLE_TRANSFORMER.
+profile: 'live_commerce'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+analysis-paths: ["analyses"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Surrogate-key salt for our own surrogate_key macro (kept stable across runs).
+vars:
+  # Attribution lag window (minutes) — MUST match the generator's LAG_MINUTES.
+  attribution_lag_minutes: 30
+  # Incremental lookback (minutes) for fact_order_line — re-attributes late-arriving
+  # orders within this window on each incremental run.
+  incremental_lookback_minutes: 120
+
+# Layer materializations + clean schema routing. Schemas are RAW/STAGING/INTERMEDIATE/
+# MARTS (no dbt_<layer> prefix) via the generate_schema_name macro override.
+models:
+  live_commerce:
+    staging:
+      +schema: staging
+      +materialized: view
+    intermediate:
+      +schema: intermediate
+      +materialized: ephemeral
+    marts:
+      +schema: marts
+      +materialized: table
+      facts:
+        +materialized: table   # fact_order_line overrides to incremental in its own config
+
+seeds:
+  live_commerce:
+    # Seeds are reference inputs consumed by staging, not BI-facing marts. Land them
+    # in the staging schema so marts.<name> stays reserved for conformed models and
+    # there is no name collision (e.g. dim_channel the seed vs dim_channel the model).
+    +schema: staging
+    seed_channel:
+      +column_types:
+        channel_id: integer
+
+snapshots:
+  live_commerce:
+    +target_schema: snapshots

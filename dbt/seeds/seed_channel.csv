@@ -1,0 +1,5 @@
+channel_id,channel_name,channel_type
+1,TV Linear,broadcast
+2,Web Shop,online
+3,Mobile App,online
+4,Call Centre,phone

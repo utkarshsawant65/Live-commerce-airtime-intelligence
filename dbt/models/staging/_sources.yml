@@ -1,0 +1,71 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      **RAW landing zone — the upstream of the whole pipeline.**
+
+      HOW THE DATA IS GENERATED: there is no public dataset with a broadcast/airtime
+      dimension, so it is generated synthetically by `generator/generate_batch.py` (Python
+      + numpy) with a *known* airtime→sales correlation baked in — orders for a product
+      spike across channels while it is on air, scaled by presenter tier and prime time.
+      Generating it ourselves gives ground truth, so the attribution and the conversion
+      z-test can be validated against a known answer. A `--dirty` mode can inject nulls,
+      duplicates, bad types and orphans to prove the pipeline survives messy feeds.
+
+      WHERE IT IS STORED INITIALLY: the generator writes CSV (and one JSON feed) to disk;
+      `generator/load_to_snowflake.py` then `PUT`s those files to a Snowflake internal
+      stage (`raw.stg_landing`) and `COPY INTO`s them into these RAW tables (typed), plus
+      one feed lands as VARIANT (`order_line_raw`, schema-on-read). A `loaded_at_utc` audit
+      column is stamped on every row (drives source freshness). The "simulated live" loop
+      (`generator/run_live.py`) repeats this as micro-batches.
+
+      Staging reads ONLY from here; nothing downstream references RAW directly.
+    database: LIVE_COMMERCE
+    schema: RAW
+    config:
+      # Freshness is measured against the audit column the loader stamps on every row.
+      loaded_at_field: loaded_at_utc
+      # Proves "data is live" and alerts on a stalled feed.
+      # During the simulated-live loop a micro-batch lands roughly every interval, so a
+      # warn at 12h / error at 24h flags a genuinely stalled generator without nagging.
+      freshness:
+        warn_after: {count: 12, period: hour}
+        error_after: {count: 24, period: hour}
+
+    tables:
+      - name: dim_product
+        description: One row per product per version (feeds the SCD2 snapshot).
+      - name: dim_presenter
+        description: One row per presenter.
+      - name: dim_show
+        description: One row per show.
+      - name: dim_channel
+        description: >
+          One row per channel. Also shipped as a dbt seed (dim_channel.csv); the seed
+          is the governed reference copy, this raw landing is the generator's emission.
+      - name: fact_airtime_segment
+        description: One row per broadcast segment (a product featured in one continuous on-air window).
+      - name: fact_order_line
+        description: >
+          One row per product line per order. The high-volume fact. Generated with the
+          airtime→sales correlation; COPY INTO'd from the internal stage. Also emitted as
+          a JSON feed landed separately as VARIANT (order_line_raw).
+        config:
+          # The hot fact: tighter freshness so a stalled order feed is caught fast.
+          freshness:
+            warn_after: {count: 6, period: hour}
+            error_after: {count: 12, period: hour}
+      - name: fact_returns
+        description: One row per returned order line.
+      - name: fact_traffic
+        description: One row per channel per minute (the conversion denominator).
+      - name: order_line_raw
+        description: >
+          Semi-structured order-line feed landed as VARIANT (schema-on-read). One row per
+          payload object. The load never breaks on a source schema change or bad type;
+          parsing + validation + quarantine happen in staging (stg_order_lines_variant).
+        config:
+          freshness:
+            warn_after: {count: 6, period: hour}
+            error_after: {count: 12, period: hour}

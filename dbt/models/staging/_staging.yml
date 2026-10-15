@@ -1,0 +1,225 @@
+version: 2
+
+models:
+  - name: stg_products
+    description: "Cleaned product versions (all history kept for the SCD2 snapshot)."
+    columns:
+      - name: product_id
+        description: Natural product key (stable across versions).
+        data_tests: [not_null]
+      - name: product_version
+        description: Version number within a product's history.
+        data_tests: [not_null]
+      - name: category
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [Fashion, Jewellery, Beauty, Home & Living, Electronics, Wellness]
+      - name: list_price_band
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [budget, mid, premium, luxury]
+      - name: is_current
+        data_tests: [not_null]
+    data_tests:
+      # The composite natural key is unique even though product_id alone is not.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [product_id, product_version]
+
+  - name: stg_presenters
+    description: "Cleaned presenters (SCD1)."
+    columns:
+      - name: presenter_id
+        data_tests: [not_null, unique]
+      - name: presenter_name
+        data_tests: [not_null]
+      - name: experience_tier
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [rookie, established, star]
+
+  - name: stg_shows
+    description: "Cleaned shows (SCD1)."
+    columns:
+      - name: show_id
+        data_tests: [not_null, unique]
+      - name: show_name
+        data_tests: [not_null]
+
+  - name: stg_channels
+    description: "Channels from the governed seed."
+    columns:
+      - name: channel_id
+        data_tests: [not_null, unique]
+      - name: channel_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [broadcast, online, phone]
+
+  - name: stg_airtime_segments
+    description: "Broadcast segments — one product featured in one continuous on-air window."
+    columns:
+      - name: segment_id
+        data_tests: [not_null, unique]
+      - name: product_id
+        data_tests:
+          - not_null
+          # Segments feature current products; orphan check against product natural keys.
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: product_id
+      - name: presenter_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_presenters')
+                field: presenter_id
+      - name: show_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_shows')
+                field: show_id
+      - name: channel_id
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_channels')
+                field: channel_id
+      - name: segment_duration_minutes
+        description: Must be positive — a segment with non-positive duration is a load error.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+
+  - name: stg_order_lines
+    description: "Order lines — one row per product line per order."
+    columns:
+      - name: order_line_id
+        data_tests: [not_null, unique]
+      - name: order_id
+        data_tests: [not_null]
+      - name: product_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: product_id
+      - name: channel_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_channels')
+                field: channel_id
+      - name: quantity
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: net_amount
+        description: Non-negative; net = gross - discount.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: stg_returns
+    description: "Returns — one row per returned order line."
+    columns:
+      - name: return_id
+        data_tests: [not_null, unique]
+      - name: order_line_id
+        description: Every return must point at a real order line (no orphan returns).
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_order_lines')
+                field: order_line_id
+      - name: returned_qty
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: reason_code
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [size_fit, not_as_described, changed_mind, damaged, late_delivery]
+
+  - name: stg_traffic
+    description: "Minute-level traffic — the conversion denominator."
+    columns:
+      - name: channel_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_channels')
+                field: channel_id
+      - name: minute_ts_utc
+        data_tests: [not_null]
+      - name: web_sessions
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [channel_id, minute_ts_utc]
+
+  - name: stg_order_lines_variant
+    description: >
+      Defensively-parsed VARIANT order-line feed (schema-on-read). Each row is flagged
+      valid / invalid; invalid rows carry a dq_failure_reason and route to quarantine.
+      try_cast means a bad source value yields NULL + a flag, never a failed load.
+    columns:
+      - name: is_valid
+        description: True when the row passed all DQ checks.
+        data_tests: [not_null]
+      - name: dq_failure_reason
+        description: Null for valid rows; the failing check for invalid rows.
+
+  - name: stg_order_lines_quarantine
+    description: >
+      Rows from the VARIANT feed that failed validation — captured, not dropped. A row
+      here means a real source-data problem to inspect/backfill. This is the proof the
+      pipeline handles dirty data: bad rows are isolated and observable.
+    columns:
+      - name: dq_failure_reason
+        description: Why the row was quarantined.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - missing_or_bad_order_line_id
+                  - missing_or_bad_product_id
+                  - missing_or_bad_quantity
+                  - non_positive_quantity
+                  - missing_or_bad_event_ts
+                  - bad_net_amount

@@ -1,0 +1,137 @@
+version: 2
+
+models:
+  - name: mart_kpi_metrics
+    description: >
+      The single governed KPI surface — one definition per KPI. GRAIN: one row per
+      (event_date, product_key, presenter_key, channel_key, attributed_segment_id).
+      Additive base measures roll up to any dimension by SUM; ratios are derived in BI.
+      BI consumes this model; it never re-derives KPI logic.
+    columns:
+      - name: event_date
+        data_tests: [not_null]
+      - name: product_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: presenter_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_presenter')
+                field: presenter_key
+      - name: channel_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_channel')
+                field: channel_key
+      - name: gmv
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: net_revenue_after_returns
+        data_tests: [not_null]
+      - name: units_sold
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              [event_date, product_key, presenter_key, channel_key, attributed_segment_id]
+
+  - name: mart_segment_performance
+    description: >
+      Hero mart. GRAIN: one row per airtime segment. Carries the live-commerce headline
+      KPIs: revenue_per_broadcast_minute, attributed_revenue, attributed_orders.
+    columns:
+      - name: segment_id
+        data_tests: [not_null, unique]
+      - name: product_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: presenter_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_presenter')
+                field: presenter_key
+      - name: segment_duration_minutes
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+      - name: revenue_per_broadcast_minute
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+  - name: mart_conversion_windows
+    description: >
+      Conversion rate + lift surface. GRAIN: one row per
+      (airtime_state, event_date, channel_key, daypart). Additive orders + web_sessions
+      roll up to any of those dims; the rate is computed in BI/DAX via DIVIDE(SUM(orders),
+      SUM(web_sessions)). Feeds the dashboard; the z-test re-aggregates to the two states.
+    columns:
+      - name: airtime_state
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [on_air, off_air]
+      - name: event_date
+        data_tests: [not_null]
+      - name: channel_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_channel')
+                field: channel_key
+      - name: daypart
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [morning, afternoon, prime_time, late_night]
+      - name: orders
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: web_sessions
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [airtime_state, event_date, channel_key, daypart]

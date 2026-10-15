@@ -1,0 +1,22 @@
+# Local quality gate — the same checks CI enforces, run before each commit.
+# Install once with: pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-merge-conflict
+
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 3.2.5
+    hooks:
+      - id: sqlfluff-lint
+        # Lint dbt SQL through the dbt templater so ref()/source() resolve.
+        additional_dependencies:
+          - dbt-snowflake>=1.7
+          - sqlfluff-templater-dbt>=3.0

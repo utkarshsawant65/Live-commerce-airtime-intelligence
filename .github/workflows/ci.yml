@@ -1,0 +1,169 @@
+name: CI
+
+# Runs on every PR into main, and on pushes to main. A red run blocks the merge
+# (set "Require status checks" on the protected main branch in repo settings).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Absolute path so it resolves regardless of a step's working-directory (steps that
+  # cd into dbt/ would otherwise look for a non-existent nested dbt/dbt/).
+  DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+  # dbt reads these via env_var() in profiles.yml (ci target, key-pair auth).
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PRIVATE_KEY_PATH: ${{ github.workspace }}/rsa_key.p8
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 — static checks. No warehouse needed, so this ALWAYS runs (even on a
+  # fork or before secrets are configured). Catches style + project errors fast.
+  # ---------------------------------------------------------------------------
+  lint-and-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Provision profiles.yml
+        run: cp dbt/profiles.example.yml dbt/profiles.yml
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt parse (project compiles / DAG valid)
+        working-directory: dbt
+        # parse does not connect; the dev target's placeholder password resolves the
+        # profile without needing a key file. This validates the whole DAG + macros +
+        # YAML — the offline static gate. (Full sqlfluff lint runs in build-and-test,
+        # where the dbt templater can resolve ref()/macros against the warehouse.)
+        run: dbt parse --no-partial-parse --target dev
+        env:
+          SNOWFLAKE_ACCOUNT: placeholder
+          SNOWFLAKE_USER: placeholder
+          SNOWFLAKE_PASSWORD: placeholder
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 — full build + test against Snowflake. Runs ONLY when the Snowflake
+  # secrets exist (skipped cleanly on forks / before setup). This is the gate.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: lint-and-parse
+    # Gate on a secret being present so the job is skipped (not failed) without setup.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Guard — require Snowflake secrets
+        id: guard
+        run: |
+          if [ -z "${{ secrets.SNOWFLAKE_ACCOUNT }}" ]; then
+            echo "Snowflake secrets not configured; skipping build/test."
+            echo "have_secrets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_secrets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write private key from secret
+        if: steps.guard.outputs.have_secrets == 'true'
+        env:
+          # Base64-encoded PEM, decoded here. base64 is single-line, so newlines in the
+          # PEM survive the GitHub Secret round-trip intact (a raw multiline secret gets
+          # its line breaks mangled -> "Unable to load PEM file").
+          PRIVATE_KEY_B64: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          echo "$PRIVATE_KEY_B64" | base64 -d > "$SNOWFLAKE_PRIVATE_KEY_PATH"
+          chmod 600 "$SNOWFLAKE_PRIVATE_KEY_PATH"
+          # Sanity: confirm it's a valid PEM before dbt tries to use it.
+          openssl pkey -in "$SNOWFLAKE_PRIVATE_KEY_PATH" -noout && echo "private key OK"
+
+      - name: Provision profiles.yml for CI
+        if: steps.guard.outputs.have_secrets == 'true'
+        # The real profiles.yml is gitignored, so CI uses the committed example (which
+        # has the ci target wired for key-pair auth via env vars).
+        run: cp dbt/profiles.example.yml dbt/profiles.yml
+
+      - name: dbt deps
+        if: steps.guard.outputs.have_secrets == 'true'
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt debug (connection check)
+        if: steps.guard.outputs.have_secrets == 'true'
+        working-directory: dbt
+        run: dbt debug --target ci
+
+      - name: Generate a small synthetic batch
+        if: steps.guard.outputs.have_secrets == 'true'
+        run: python generator/generate_batch.py --out generator/output --days 2 --seed 42
+
+      - name: Load to Snowflake RAW
+        if: steps.guard.outputs.have_secrets == 'true'
+        env:
+          SNOWFLAKE_ROLE: ROLE_LOADER
+          SNOWFLAKE_WAREHOUSE: WH_LOAD
+          SNOWFLAKE_DATABASE: LIVE_COMMERCE
+          SNOWFLAKE_SCHEMA: RAW
+        run: python generator/load_to_snowflake.py --in generator/output --truncate
+
+      - name: sqlfluff lint (dbt templater — resolves ref()/macros)
+        if: steps.guard.outputs.have_secrets == 'true'
+        env:
+          DBT_TARGET: ci
+        # Now that we have a connection + dbt deps, the dbt templater can compile the
+        # models, so sqlfluff lints the real SQL (catches genuine style issues, not the
+        # false positives a macro-blind offline lint would produce).
+        # Reported but non-blocking for now (|| true); flip to blocking once the style
+        # baseline is confirmed clean against the dbt templater.
+        run: sqlfluff lint dbt/models --dialect snowflake --templater dbt || true
+
+      - name: Tear down prior CI schemas (truly start from zero)
+        if: steps.guard.outputs.have_secrets == 'true'
+        working-directory: dbt
+        env:
+          DBT_SCHEMA_SUFFIX: _CI
+        # The _CI schemas persist between runs. --full-refresh recreates MODELS cleanly,
+        # but seeds collide ("object already exists"). Dropping the CI schemas first makes
+        # every run reproducible from a genuinely empty namespace.
+        run: |
+          dbt run-operation drop_ci_schemas --target ci
+
+      - name: dbt build (run + test everything)
+        if: steps.guard.outputs.have_secrets == 'true'
+        working-directory: dbt
+        env:
+          # Build into CI-isolated schemas (STAGING_CI, MARTS_CI, ...) so this run never
+          # races with or is polluted by local dev in the shared database. Combined with
+          # --full-refresh (rebuild the incremental fact from zero), CI is fully
+          # reproducible and self-contained.
+          DBT_SCHEMA_SUFFIX: _CI
+        run: dbt build --target ci --full-refresh
+
+      - name: dbt source freshness
+        if: steps.guard.outputs.have_secrets == 'true'
+        working-directory: dbt
+        # Don't fail the build on a stale-feed warning in CI; report it.
+        run: dbt source freshness --target ci || true

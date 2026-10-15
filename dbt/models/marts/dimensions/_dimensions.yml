@@ -1,0 +1,98 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: "Grain: one row per calendar day. Generated via dbt_utils.date_spine."
+    columns:
+      - name: date_key
+        data_tests: [not_null, unique]
+      - name: date_day
+        data_tests: [not_null, unique]
+      - name: calendar_year
+        data_tests: [not_null]
+
+  - name: dim_time_minute
+    description: "Grain: one row per minute of day (1440 rows). Carries prime-time flag + daypart."
+    columns:
+      - name: time_minute_key
+        data_tests: [not_null, unique]
+      - name: minute_of_day
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1439
+                inclusive: true
+      - name: daypart
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [morning, afternoon, prime_time, late_night]
+
+  - name: dim_product
+    description: >
+      Grain: one row per product per version (SCD2). Sourced from dim_product_snapshot;
+      includes the unknown member (product_id = -1). product_key is per version.
+    columns:
+      - name: product_key
+        description: Surrogate key per product version (product_id + valid_from).
+        data_tests: [not_null, unique]
+      - name: product_id
+        description: Natural key (not unique across versions).
+        data_tests: [not_null]
+      - name: category
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [Fashion, Jewellery, Beauty, Home & Living, Electronics, Wellness, Unknown]
+      - name: list_price_band
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [budget, mid, premium, luxury, unknown]
+      - name: is_current
+        data_tests: [not_null]
+    data_tests:
+      # No two version rows for the same product may have the same valid_from.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [product_id, valid_from_ts]
+
+  - name: dim_presenter
+    description: "Grain: one row per presenter (SCD1). Includes unknown member (-1)."
+    columns:
+      - name: presenter_key
+        data_tests: [not_null, unique]
+      - name: presenter_id
+        data_tests: [not_null, unique]
+      - name: experience_tier
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [rookie, established, star, unknown]
+
+  - name: dim_show
+    description: "Grain: one row per show (SCD1). Includes unknown member (-1)."
+    columns:
+      - name: show_key
+        data_tests: [not_null, unique]
+      - name: show_id
+        data_tests: [not_null, unique]
+
+  - name: dim_channel
+    description: "Grain: one row per channel (static, from seed). Includes unknown member (-1)."
+    columns:
+      - name: channel_key
+        data_tests: [not_null, unique]
+      - name: channel_id
+        data_tests: [not_null, unique]
+      - name: channel_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [broadcast, online, phone, unknown]
