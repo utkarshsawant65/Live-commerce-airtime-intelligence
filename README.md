@@ -1,174 +1,168 @@
-# Live Commerce — Airtime Intelligence Platform
+# Live Commerce Airtime Intelligence Platform
 
 [![CI](https://github.com/utkarshsawant65/Live-commerce-airtime-intelligence/actions/workflows/ci.yml/badge.svg)](https://github.com/utkarshsawant65/Live-commerce-airtime-intelligence/actions/workflows/ci.yml)
-![dbt](https://img.shields.io/badge/dbt-1.8%2B-FF694B?logo=dbt&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt-1.10%2B-FF694B?logo=dbt&logoColor=white)
 ![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?logo=snowflake&logoColor=white)
 ![Power BI](https://img.shields.io/badge/Power%20BI-F2C811?logo=powerbi&logoColor=black)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 
-A governed, tested **dbt + Snowflake + Power BI** data product that ties every order to the
-**broadcast airtime segment** that drove it, and measures live-commerce performance:
-**revenue per broadcast minute**, **conversion lift**, and **return-rate intelligence** by
-presenter, product and channel.
-
----
+A dbt + Snowflake + Power BI data product for live commerce. It attributes each order to the
+broadcast airtime segment that drove it and reports revenue per broadcast minute, on-air
+conversion lift and return rates by presenter, product and channel.
 
 ## What it is
 
-Live-commerce retailers sell via live broadcast (TV + social) backed by an online shop and
-app. The defining mechanic: a product shown on air by a presenter in a time window drives a
-simultaneous sales spike across every channel (call-centre, web, app). This project models
-that mechanic end to end.
+Live-commerce retailers sell through live broadcast (TV and streams) alongside a web shop,
+app and call centre. When a presenter features a product on air, orders for that product
+rise across every channel. This project models that end to end.
 
-A synthetic but realistically correlated stream of broadcast airtime, cross-channel orders,
-returns and minute-level viewership is landed in Snowflake, then cleaned and modelled with dbt
-into a **star schema** (SCD2 product history, conformed dimensions). An attribution layer ties
-every order to the airtime segment that drove it. A governed **metrics mart** defines each KPI
-once; a **Power BI** model with **row-level security** turns it into self-service dashboards.
-The whole thing is engineered like software — incremental models, dbt tests written test-first,
-a Git branch strategy, and GitHub Actions CI that runs the full build on every pull request.
+A Python generator produces correlated airtime, order, return and minute-level traffic data.
+It is loaded into Snowflake and modelled with dbt into a star schema: conformed dimensions,
+an SCD2 product dimension, an attribution model, and marts that define each KPI once. A
+Power BI report with row-level security reads the marts.
 
-> **Why synthetic data?** No public dataset carries a broadcast/airtime dimension. Generating
-> it means the airtime→sales correlation is known, so the analytics produce visible, testable
-> signal and the attribution logic can be verified against ground truth.
+The data is synthetic because no public dataset has a broadcast/airtime dimension. Since the
+generator builds in a known airtime effect, the attribution and the lift test can be checked
+against it.
 
 ## Questions it answers
 
-| Business question | Answered by |
+| Question | Answered by |
 |---|---|
-| Which airtime segments (product × presenter × time window) earn the most per broadcast minute? | `mart_segment_performance` → **revenue per broadcast minute** |
-| Does going on air actually lift conversion — and is it statistically significant? | `mart_conversion_windows` + a **two-proportion z-test** |
-| Which products, presenters and categories drive the highest return rates? | `fact_returns` + **return rate** KPI |
-| What is net revenue after returns by show, presenter and channel? | `mart_kpi_metrics` — one governed definition |
+| Which segments (product × presenter × time window) earn the most per broadcast minute? | `mart_segment_performance` |
+| Does being on air lift online conversion, and is the lift significant? | `mart_conversion_windows` + a two-proportion z-test |
+| Which products, presenters and categories have the highest return rates? | `fact_returns`, `mart_kpi_metrics` |
+| What is net revenue after returns by show, presenter and channel? | `mart_kpi_metrics` |
 
 ## Architecture
 
 ```
-[Python generator] ──CSV/JSON──▶ [Snowflake stage] ──COPY INTO──▶ RAW
-        │ (batch, then looped for "simulated live")
-        ▼
-     RAW  →  STAGING  →  INTERMEDIATE  →  MARTS  →  Power BI
-           (1:1 clean)  (attribution)   (facts +   (star model,
-                                         dims +      measures, RLS)
-                                         metrics)
+generator (Python) --CSV/JSON--> Snowflake stage --COPY INTO--> RAW
+                                                                 |
+                                                                dbt
+                                                                 v
+        STAGING  ->  INTERMEDIATE  ->  MARTS (facts, dims, metric marts)  ->  Power BI
+      (clean 1:1)   (attribution)           SNAPSHOTS (SCD2 product)
 ```
 
-**Layering rule:** BI reads from `MARTS` only. No dashboard or ad-hoc query ever touches
-`STAGING` or `RAW`. This is what guarantees consistent KPIs.
+Power BI reads `MARTS` only; nothing downstream queries `RAW` or `STAGING`.
 
-## Data model (star schema)
+## Data model
 
-**Dimensions** — `dim_date`, `dim_time_minute` (prime-time flag, daypart), `dim_product`
-(**SCD2**, point-in-time), `dim_presenter` (SCD1), `dim_channel`, `dim_show`. Every dimension
-carries a surrogate key and an unknown member (`-1`) so fact joins never silently drop rows.
+- **Dimensions:** `dim_date`, `dim_time_minute` (daypart, prime-time flag), `dim_product`
+  (SCD2), `dim_presenter`, `dim_show`, `dim_channel`. All have surrogate keys; product,
+  presenter, show and channel also have an `Unknown` member so fact joins never drop rows.
+- **Facts:** `fact_order_line` (one row per order line, incremental), `fact_airtime_segment`
+  (one row per segment), `fact_returns` (one row per returned line), `fact_traffic` (one row
+  per channel per minute).
+- **Attribution:** `int_orders_attributed_to_airtime` matches each order line to a segment for
+  the same product whose window `[start, end + 30 min)` contains the order time. Overlaps go
+  to the latest start; unmatched orders get segment `-1` (organic).
+- **Marts:** `mart_kpi_metrics` (additive base measures), `mart_segment_performance`
+  (revenue per broadcast minute), `mart_conversion_windows` (online orders and sessions
+  on air vs off air, by date, channel and daypart).
 
-**Facts** — `fact_order_line` (one row per product line per order, **incremental**),
-`fact_airtime_segment` (one row per broadcast segment), `fact_returns` (one row per returned
-line), `fact_traffic` (one row per channel per minute — the conversion denominator).
+KPI definitions: [docs/KPI_CATALOG.md](docs/KPI_CATALOG.md).
 
-**Attribution** — `int_orders_attributed_to_airtime` matches each order to the airtime segment
-for that product whose window `[start, end + lag]` contains the order time, applying a
-last-touch tie-break for overlaps and tagging unmatched orders as organic (segment `-1`).
+## Results (sample run)
 
-**Metrics marts** — `mart_kpi_metrics` (additive base measures), `mart_segment_performance`
-(revenue per broadcast minute), `mart_conversion_windows` (on-air vs off-air conversion).
+On the 5-day sample batch from the quick start (`--days 5 --seed 42`), online conversion is
+0.026% on air vs 0.014% off air (4,653 orders / 18.2M sessions vs 1,309 / 9.7M), a relative
+lift of +89.0% (z = 20.69, one-sided p ≈ 2e-95).
 
 ## Dashboard
 
-A four-page Power BI report built on the marts only:
+Four Power BI pages built on the marts:
 
-| Page | Focus |
+| Page | Content |
 |---|---|
-| **Overview** | Net revenue after returns, GMV, revenue per broadcast minute, channel mix |
-| **Airtime** | Presenter and segment ROI, revenue per minute by daypart, category × presenter heatmap |
-| **Conversion** | On-air vs off-air conversion, lift by daypart, z-test significance |
-| **Returns** | Return rate by category, reason code and price band; refunded value |
+| Overview | Net revenue after returns, GMV, revenue per broadcast minute, channel mix |
+| Airtime | Revenue by presenter and tier, revenue per minute by daypart, category × presenter |
+| Conversion | On-air vs off-air conversion, by daypart, with the z-test result |
+| Returns | Return rate by category, reason and price band; refunded value |
 
-On a generated dataset, airtime drives roughly two-thirds of revenue and a statistically
-significant conversion lift (p < 0.01), with prime time the most productive daypart and returns
-concentrated in Fashion and Jewellery. The `.pbix` file is not versioned; see
-[`PROJECT_GUIDE.md` §18](PROJECT_GUIDE.md#18-dashboard-insights--the-story-each-chart-tells)
-for a page-by-page walkthrough.
+The `.pbix` is not in the repo. The [project guide](PROJECT_GUIDE.md#13-dashboard) describes
+each page.
 
 ## Repository layout
 
-| Path | Purpose |
+| Path | Contents |
 |---|---|
-| `generator/` | Python synthetic data generator, Snowflake loader, and "simulated live" loop |
-| `snowflake/` | `00_setup.sql` (database, schemas, warehouses, RBAC, stage) and an SCD2 demo script |
-| `dbt/` | dbt-core project: staging → intermediate → marts, snapshots, tests, macros, seeds |
-| `analysis/` | Two-proportion z-test on conversion lift |
-| `streaming/` | Snowflake-native real-time upgrade path (Streams + Tasks, Dynamic Tables) |
-| `.github/workflows/` | CI: `dbt parse` + sqlfluff, then `dbt build` / test / freshness on Snowflake |
-| `docs/KPI_CATALOG.md` | One definition per KPI (formula • grain • filters) |
-| `docs/CI_SETUP.md` | One-time CI setup: key-pair auth, GitHub Secrets, branch protection |
-| `DECISIONS.md` | Architecture decisions, the alternatives rejected, and how strongly each holds |
-| `PROJECT_GUIDE.md` | Full walkthrough: business case, data flow, file-by-file index |
+| `generator/` | Data generator, Snowflake loader, micro-batch loop |
+| `snowflake/` | `00_setup.sql` (database, schemas, warehouses, roles, stage) and `demo_scd2.sql` |
+| `dbt/` | Staging, intermediate and mart models, snapshot, seeds, macros, tests |
+| `analysis/` | Two-proportion z-test for conversion lift |
+| `streaming/` | Optional Streams + Tasks and Dynamic Table scripts |
+| `.github/workflows/ci.yml` | CI: offline parse and smoke test; Snowflake build, tests and lint |
+| [docs/KPI_CATALOG.md](docs/KPI_CATALOG.md) | KPI formulas, grains and filters |
+| [docs/CI_SETUP.md](docs/CI_SETUP.md) | Key-pair auth, GitHub secrets, branch protection |
+| [DECISIONS.md](DECISIONS.md) | Design decisions and the alternatives considered |
+| [PROJECT_GUIDE.md](PROJECT_GUIDE.md) | Layer-by-layer walkthrough and file index |
 
 ## Quick start
 
-The generator and the z-test run fully offline; Snowflake is needed only for loading and dbt.
+The generator and the z-test run offline. Snowflake is only needed to load data and run dbt.
 
 ```bash
-# 1. Python environment (3.12)
+# 1. Python 3.12 environment
 python -m venv .venv
-source .venv/Scripts/activate        # Git Bash; .venv\Scripts\activate on cmd/PowerShell,
-                                     # source .venv/bin/activate on macOS/Linux
+source .venv/Scripts/activate      # Git Bash; PowerShell: .venv\Scripts\Activate.ps1; macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Generate a batch of synthetic data (add --dirty to inject realistic bad rows)
+# 2. Generate a 5-day batch (add --dirty to corrupt the JSON order-line feed)
 python generator/generate_batch.py --out generator/output --days 5 --seed 42
 
-# 3. Run the conversion-lift z-test offline on the generated CSVs
+# 3. Run the conversion-lift z-test on the generated CSVs
 python analysis/conversion_lift_test.py --in generator/output
 ```
 
 With a Snowflake account:
 
 ```bash
-# 4. Provision the platform: run snowflake/00_setup.sql in a worksheet as ACCOUNTADMIN
-#    (replace <YOUR_USER> in section 4 first).
+# 4. Run snowflake/00_setup.sql as a user with ACCOUNTADMIN. Edit and uncomment section 4
+#    to grant role_loader, role_transformer and role_bi_reader to your user.
 
-# 5. Configure credentials
-cp .env.example .env                              # fill in your account / user / password
-cp dbt/profiles.example.yml dbt/profiles.yml      # gitignored
-#    Load .env into your shell (PowerShell: `. .\load_env.ps1`; bash: `set -a; source .env; set +a`)
+# 5. Credentials
+cp .env.example .env                            # fill in account, user, password
+cp dbt/profiles.example.yml dbt/profiles.yml    # gitignored
+set -a; source .env; set +a                     # PowerShell: . .\load_env.ps1
 
-# 6. Load RAW and build everything (models + tests)
+# 6. Load RAW, then build and test everything
 python generator/load_to_snowflake.py --in generator/output --truncate
-cd dbt && dbt deps && dbt build --profiles-dir .
+cd dbt && dbt deps && dbt build --profiles-dir . && cd ..
 
-# Optional: simulated live micro-batches with incremental dbt after each load
+# 7. Optional: z-test on the mart instead of the CSVs (uses ROLE_BI_READER / WH_BI)
+python analysis/conversion_lift_test.py --from-snowflake
+
+# 8. Optional: micro-batch loop: append a 1-day batch to RAW every 60 s, then dbt build
 python generator/run_live.py --iterations 6 --interval 60 --run-dbt
 ```
 
+`run_live.py` continues from the last batch's manifest in `generator/output` (next window,
+next order and segment ids). Its `--seed` (default 42, same as step 2) fixes the dimensions,
+so products and presenters stay identical to the initial load.
+
 ## Engineering practices
 
-- **Test-first data quality** — generic dbt tests (`unique`, `not_null`, `accepted_values`,
-  `relationships`, ranges) plus singular tests for business invariants (return rate ≤ 1, no
-  future attribution, attribution inside the lag window, no dirty row passes as valid).
-- **Resilient ingestion** — a VARIANT (schema-on-read) landing path with defensive parsing and a
-  quarantine model, exercised by the generator's `--dirty` mode.
-- **Source freshness** — `dbt source freshness` alerts on a stalled feed.
-- **Incremental modelling** — `fact_order_line` uses a `merge` strategy with a lookback window
-  that re-attributes late-arriving orders without rebuilding.
-- **Governance** — Snowflake RBAC (functional roles, separated warehouses) + Power BI RLS.
-- **CI/CD** — GitHub Actions with key-pair auth builds and tests every PR in isolated `_CI`
-  schemas with `--full-refresh`.
+- **Tests:** 185 data tests, made up of generic tests (`unique`, `not_null`, `accepted_values`,
+  `relationships`, ranges) plus singular tests for no future attribution, attribution inside
+  the lag window, returns never exceeding sales, and no invalid row passing as valid.
+- **Semi-structured ingestion:** the JSON order-line feed lands as `VARIANT`, is parsed with
+  `try_cast`, and failing rows go to a quarantine model with a reason. `--dirty` exercises it.
+- **Incremental model:** `fact_order_line` merges on `order_line_id` and reprocesses a
+  120-minute lookback plus anything loaded since the last run, so late rows are picked up.
+- **Freshness:** `dbt source freshness` thresholds on every RAW table.
+- **Access:** functional Snowflake roles and separate load/transform/BI warehouses; RLS in
+  Power BI.
+- **CI:** GitHub Actions on pull requests to `main`: offline `dbt parse` and a generator/z-test
+  smoke test, then (if Snowflake secrets are set) a full `dbt build` in `_CI` schemas with
+  key-pair auth, and `sqlfluff` lint.
 
 ## Status
 
-- [x] Foundations — scaffold, Snowflake setup, dbt skeleton
-- [x] Generate + land — Python generator with airtime→sales correlation
-- [x] Staging — 1:1 cleaned/typed/deduped models, sources + freshness, generic tests
-- [x] Dimensions — conformed dims, `date_spine`, SCD2 snapshot on `dim_product`
-- [x] Intermediate + facts — attribution model, incremental `fact_order_line`, singular tests
-- [x] Marts + metrics + stats — `mart_kpi_metrics`, KPI catalog, the z-test
-- [x] CI/CD — GitHub Actions against Snowflake (24 models, 197 tests green)
-- [x] "Live" + docs — generator loop, streaming upgrade path, `dbt docs` lineage with exposure
-- [x] Power BI — star model, measures, RLS, four-page dashboard
-
-Ideas for further work are listed at the end of [`DECISIONS.md`](DECISIONS.md).
+The pipeline has been built and run end to end on Snowflake: generator, load, 24 dbt models,
+1 snapshot, 2 seeds and 185 tests, CI, and the four-page Power BI report. Known limitations
+and next steps are at the end of [DECISIONS.md](DECISIONS.md).
 
 ## License
 

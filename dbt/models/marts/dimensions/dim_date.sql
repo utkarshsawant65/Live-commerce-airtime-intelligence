@@ -1,25 +1,31 @@
 {#
-    dim_date — one row per calendar day.
-
-    Built with dbt_utils.date_spine (not a hand-maintained table) so the calendar is
-    generated, gap-free, and clipped to the actual data range. The spine is generated
-    over a fixed, generous range (literal dates) and then filtered to the data window —
-    we do NOT pass a CTE reference into the date_spine macro, because the macro nests its
-    own query and an outer CTE is not in scope there on Snowflake.
+    One row per calendar day, covering every date that appears in orders, returns,
+    segments or traffic. The spine uses literal bounds and is then clipped, because
+    dbt_utils.date_spine cannot take a CTE reference as its start/end.
 #}
 
-with bounds as (
+with source_ranges as (
+    select min(event_ts_utc) as min_ts, max(event_ts_utc) as max_ts from {{ ref('stg_order_lines') }}
+    union all
+    select min(return_ts_utc), max(return_ts_utc) from {{ ref('stg_returns') }}
+    union all
+    select min(start_ts_utc), max(end_ts_utc) from {{ ref('stg_airtime_segments') }}
+    union all
+    select min(minute_ts_utc), max(minute_ts_utc) from {{ ref('stg_traffic') }}
+),
+
+bounds as (
     select
-        dateadd('day', -2, cast(min(event_ts_utc) as date)) as min_date,
-        dateadd('day', 2, cast(max(event_ts_utc) as date)) as max_date
-    from {{ ref('stg_order_lines') }}
+        cast(min(min_ts) as date) as min_date,
+        cast(max(max_ts) as date) as max_date
+    from source_ranges
 ),
 
 spine as (
     {{ dbt_utils.date_spine(
         datepart="day",
-        start_date="cast('2020-01-01' as date)",
-        end_date="cast('2030-01-01' as date)"
+        start_date="cast('2000-01-01' as date)",
+        end_date="cast('2050-01-01' as date)"
     ) }}
 ),
 

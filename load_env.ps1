@@ -1,7 +1,5 @@
-# load_env.ps1 — load .env into the current PowerShell session.
-# Usage (dot-source so the vars stick in THIS terminal):
+# Load .env into the current PowerShell session. Dot-source it so the variables persist:
 #     . .\load_env.ps1
-# Run once per new terminal, BEFORE any dbt command.
 
 $envFile = Join-Path $PSScriptRoot ".env"
 if (-not (Test-Path $envFile)) {
@@ -9,9 +7,16 @@ if (-not (Test-Path $envFile)) {
     return
 }
 
-Get-Content $envFile | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object {
-    $name, $value = $_ -split '=', 2
-    Set-Item -Path "env:$($name.Trim())" -Value $value.Trim()
+foreach ($line in Get-Content $envFile) {
+    $line = $line.Trim()
+    if ($line -eq "" -or $line.StartsWith("#") -or -not $line.Contains("=")) { continue }
+    $line = $line -replace '^export\s+', ''
+    $name, $value = $line -split '=', 2
+    $value = $value.Trim()
+    if ($value.Length -ge 2 -and ($value[0] -eq '"' -or $value[0] -eq "'") -and $value[-1] -eq $value[0]) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+    Set-Item -Path "env:$($name.Trim())" -Value $value
 }
 
 Write-Host "Loaded .env -> SNOWFLAKE_ACCOUNT=$env:SNOWFLAKE_ACCOUNT, USER=$env:SNOWFLAKE_USER" -ForegroundColor Green

@@ -1,10 +1,4 @@
-{#
-    Staging: order lines. 1:1, typed, deduped on order_line_id.
-
-    The transaction price (unit_price_paid) and monetary measures live HERE in the
-    fact lineage, never in a dimension. We surface them
-    cleanly and let the marts fact own the grain.
-#}
+{# Order lines from the typed CSV feed, deduped on order_line_id (latest load wins). #}
 
 with source as (
     select * from {{ source('raw', 'fact_order_line') }}
@@ -15,7 +9,7 @@ deduped as (
         *,
         row_number() over (
             partition by order_line_id
-            order by loaded_at_utc desc
+            order by loaded_at_utc desc, event_ts_utc desc
         ) as _row_num
     from source
 )

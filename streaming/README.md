@@ -1,69 +1,43 @@
-# Production-Readiness: Real-Time Ingestion (showcase, not used by the demo)
+# Near-real-time option
 
-This module exists to answer one question directly: **"This is batch — how would you make it
-real-time, and why isn't it already?"** It is deliberately **not wired into the demo**, because
-micro-batch is the correct choice for this workload. It documents and *builds* the upgrade path
-so the decision is defensible, not hand-waved.
+The default pipeline is micro-batch: the generator's files are `PUT` to a stage, loaded with
+`COPY INTO`, and dbt rebuilds the models (incrementally for `fact_order_line`). The scripts
+here show how to process order lines continuously inside Snowflake if fresher data were
+needed. They are optional and not part of the dbt build.
 
-## TL;DR decision
+## Why micro-batch is the default
 
-> The demo ingests via micro-batch (`PUT` + `COPY INTO`) and re-models with dbt incremental.
-> That is the industry-standard pattern for an **analytical** warehouse. If the business
-> required near-real-time freshness, the correct upgrade is **Snowflake-native** —
-> **Streams + Tasks** or **Dynamic Tables** — not a streaming bus like Kafka.
+The consumers are dashboards and segment-level KPIs, where minutes of latency are fine. A
+message bus such as Kafka would add a second system to run, and the data would still be
+loaded into the warehouse in batches. If fresher data is required, Snowflake's own features
+cover it:
 
-## Why not Kafka / Pub-Sub here?
-
-Kafka and Pub/Sub solve **low-latency, high-throughput event transport** with many producers
-and consumers decoupled in real time. They are the right tool for *operational* systems
-(fraud scoring, live inventory, clickstream fan-out). This project is the opposite shape:
-
-| Dimension | This workload | What Kafka is for |
+| Option | File | Use when |
 |---|---|---|
-| Latency need | minutes-fresh analytics is correct | sub-second event processing |
-| Consumer | a warehouse queried for KPIs | many real-time microservices |
-| Pattern | batch/micro-batch analytical load | continuous event streaming |
-| Cost/ops | one platform (Snowflake) | a second distributed system to run |
+| Stream + Task | [`01_streams_and_tasks.sql`](01_streams_and_tasks.sql) | the logic needs explicit `MERGE` control or several statements |
+| Dynamic Table | [`02_dynamic_tables.sql`](02_dynamic_tables.sql) | the transform is a single `SELECT` and a target lag is enough |
 
-Putting Kafka *in front of* a warehouse you query for daily/segment KPIs adds a streaming tier
-whose latency advantage the warehouse boundary discards — you still land in micro-batches. It
-would be **over-engineering**, and a mature reviewer reads it as such. The right "more
-real-time" answer stays inside the platform you already chose.
+Continuous ingestion (rather than continuous transformation) would be the next step:
+Snowpipe auto-ingest or Snowpipe Streaming.
 
-## The two native upgrade paths (both built here)
+## What the scripts create
 
-### 1. Streams + Tasks — [`01_streams_and_tasks.sql`](01_streams_and_tasks.sql)
-- A **STREAM** captures the change set (CDC) on `raw.fact_order_line`.
-- A scheduled **TASK** consumes only the delta and `MERGE`s it into a curated table.
-- Gated on `system$stream_has_data(...)` so an idle feed costs nothing.
-- Choose when you need procedural/multi-statement logic or fine control over the merge.
+- **Stream + Task:** a stream on `raw.fact_order_line` and a task that runs every minute,
+  only when the stream has data, merging new rows into `marts.rt_order_line`. Tasks are created
+  suspended; `alter task raw.task_merge_order_line resume;` starts it.
+- **Dynamic Table:** `marts.dt_order_line` with `target_lag = '1 minute'` over
+  `raw.fact_order_line`. It is suspended right after creation;
+  `alter dynamic table marts.dt_order_line resume;` starts refreshes.
 
-### 2. Dynamic Tables — [`02_dynamic_tables.sql`](02_dynamic_tables.sql)
-- Declare a `SELECT` + a `TARGET_LAG`; Snowflake maintains it incrementally within that lag.
-- No stream, no task, no hand-written merge — declarative freshness.
-- Choose when the transform is a single `SELECT` (most modelling) and you want freshness as a
-  declared SLA rather than an imperative schedule.
+## Prerequisites
 
-### The tier beyond these
-If ingestion itself had to be continuous (not just the transform), the next step is
-**Snowpipe Streaming** (row-level ingestion via the SDK) or **Snowpipe auto-ingest** (file
-notifications). Still Snowflake-native; still no second system to operate.
+Run `snowflake/00_setup.sql` and load at least one batch first. Each script lists its
+prerequisites in its header:
 
-## When I would actually flip the switch
+- Both: change tracking on `raw.fact_order_line`, enabled by its owner (`role_loader`).
+- Streams + Tasks: `CREATE STREAM` / `CREATE TASK` on `RAW` and `EXECUTE TASK` on the account
+  for `role_transformer`, granted as ACCOUNTADMIN. These are not in `00_setup.sql`.
+- Dynamic Table: otherwise only what `00_setup.sql` grants (`SELECT` on RAW, `ALL` on
+  `MARTS`).
 
-I would move off micro-batch only when a concrete requirement appears:
-- A stakeholder needs a KPI fresh in **seconds, not minutes** (e.g. a live on-air ops board).
-- The micro-batch cadence can no longer keep up with volume within its window.
-
-Until then, micro-batch is cheaper, simpler, fully testable in CI, and demonstrably correct.
-
-## How to run (when a Snowflake account exists)
-
-```sql
--- after snowflake/00_setup.sql and at least one load:
-!source streaming/01_streams_and_tasks.sql      -- then: alter task ... resume;
--- or, the declarative alternative:
-!source streaming/02_dynamic_tables.sql
-```
-
-Both are idempotent (`create ... if not exists`) and suspended/cost-controlled by default.
+Both scripts use `create ... if not exists` and can be run from a Snowsight worksheet.

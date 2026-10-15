@@ -1,18 +1,7 @@
 {#
-    stg_order_lines_variant — parse the VARIANT order-line feed defensively (schema-on-read).
-
-    This is the resilient counterpart to stg_order_lines (which reads the typed CSV table).
-    It reads raw.order_line_raw, where each row is an untyped JSON payload, and:
-      * extracts each field by path (payload:field),
-      * uses try_cast so a bad type yields NULL instead of failing the whole run,
-      * trims/normalises text,
-      * flags each row valid / invalid with an explicit reason, so downstream can split
-        clean rows from quarantine (stg_order_lines_quarantine) — bad rows are CAPTURED,
-        never silently dropped and never allowed to break the load.
-
-    Why this exists: a typed table breaks the moment a source sends a bad value or changes
-    shape. Landing as VARIANT + parsing here means ingestion is decoupled from schema, and
-    data-quality failures become observable rows we can quarantine and backfill.
+    Order lines from the JSON feed (raw.order_line_raw, VARIANT). Fields are extracted
+    with try_cast so a bad value becomes null instead of failing the run; each row is
+    flagged is_valid with a dq_failure_reason. Invalid rows go to stg_order_lines_quarantine.
 #}
 
 with raw_payloads as (
@@ -40,19 +29,29 @@ parsed as (
     from raw_payloads
 ),
 
+known_products as (
+    select distinct product_id
+    from {{ ref('stg_products') }}
+),
+
 validated as (
     select
-        *,
+        p.*,
         case
-            when order_line_id is null then 'missing_or_bad_order_line_id'
-            when product_id is null then 'missing_or_bad_product_id'
-            when quantity is null then 'missing_or_bad_quantity'
-            when quantity < 1 then 'non_positive_quantity'
-            when event_ts_utc is null then 'missing_or_bad_event_ts'
-            when net_amount is null or net_amount < 0 then 'bad_net_amount'
-            else null
+            when p.order_line_id is null then 'missing_or_bad_order_line_id'
+            when p.product_id is null then 'missing_or_bad_product_id'
+            when p.quantity is null then 'missing_or_bad_quantity'
+            when p.quantity < 1 then 'non_positive_quantity'
+            when p.event_ts_utc is null then 'missing_or_bad_event_ts'
+            when p.net_amount is null or p.net_amount < 0 then 'bad_net_amount'
+            when k.product_id is null then 'unknown_product_id'
+            when row_number() over (
+                partition by p.order_line_id
+                order by p.loaded_at_utc, p.source_file
+            ) > 1 then 'duplicate_order_line'
         end as dq_failure_reason
-    from parsed
+    from parsed as p
+    left join known_products as k on p.product_id = k.product_id
 )
 
 select

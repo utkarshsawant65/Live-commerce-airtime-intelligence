@@ -1,19 +1,14 @@
-{#
-    fact_traffic — GRAIN: one row per channel per minute.
-    Measures: concurrent_viewers, web_sessions. The conversion DENOMINATOR:
-    without it "conversion lift" has no "conversion of what?" answer.
-    Table materialization.
-
-    Joined to dim_channel (surrogate FK) and dim_time_minute (minute-of-day key) so the
-    BI model can slice traffic by channel and by daypart / prime-time.
-#}
+{# One row per channel per minute: viewers and web sessions (the conversion denominator). #}
 
 with traffic as (
     select * from {{ ref('stg_traffic') }}
 ),
 
 dim_channel as (
-    select channel_id, channel_key from {{ ref('dim_channel') }}
+    select
+        channel_id,
+        channel_key
+    from {{ ref('dim_channel') }}
 )
 
 select
@@ -26,4 +21,8 @@ select
     t.web_sessions
 from traffic as t
 left join dim_channel as c on t.channel_id = c.channel_id
-cross join (select channel_key from {{ ref('dim_channel') }} where channel_id = -1) as dcu
+cross join (
+    select channel_key
+    from {{ ref('dim_channel') }}
+    where channel_id = -1
+) as dcu

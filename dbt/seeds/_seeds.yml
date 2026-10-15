@@ -1,0 +1,21 @@
+version: 2
+
+seeds:
+  - name: seed_channel
+    description: Reference list of sales channels and their type; source of stg_channels.
+    columns:
+      - name: channel_id
+        description: Channel natural key.
+        data_tests: [not_null, unique]
+      - name: channel_type
+        description: broadcast, online or phone.
+
+  - name: category_return_baseline
+    description: Baseline return rate per product category. Reference data; not used by any model yet.
+    columns:
+      - name: category
+        data_tests: [not_null, unique]
+      - name: return_baseline_rate
+        description: Expected share of units returned.
+      - name: is_heavy_returner
+        description: True for categories with structurally high returns.

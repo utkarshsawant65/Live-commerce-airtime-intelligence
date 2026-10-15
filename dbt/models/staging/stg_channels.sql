@@ -1,9 +1,4 @@
-{#
-    Staging: channels. Reads from the governed SEED (dim_channel.csv), not raw —
-    the seed is the curated reference copy. This keeps channel
-    classification (broadcast/online/phone) under version control rather than at the
-    mercy of whatever the generator emitted.
-#}
+{# Channels from the seed_channel seed, which is the maintained reference list (not RAW). #}
 
 select
     channel_id,

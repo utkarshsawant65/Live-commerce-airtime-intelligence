@@ -1,100 +1,83 @@
-# CI/CD Setup — GitHub Actions + Snowflake key-pair auth
+# CI Setup
 
-The CI workflow ([.github/workflows/ci.yml](../.github/workflows/ci.yml)) runs on every PR to
-`main`:
-1. **lint-and-parse** (always) — installs deps, `dbt parse` (DAG valid), sqlfluff lint.
-2. **build-and-test** (when Snowflake secrets exist) — generates a small batch, loads RAW,
-   runs `dbt build` (every model + all tests) and `dbt source freshness` against Snowflake.
+The workflow in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on pull
+requests and pushes to `main`, and can be started manually. Runs are serialised (one at a
+time) because they share the RAW schema.
 
-A red run blocks the merge once you enable branch protection (last section). CI authenticates
-to Snowflake with a **key-pair** (no password in the pipeline) — the production-standard
-approach. Follow these one-time steps.
+| Job | When | What it does |
+|---|---|---|
+| `parse` | always | `dbt deps` + `dbt parse` offline with placeholder credentials; generates a 2-day batch and runs the z-test as a smoke test |
+| `check-secrets` | always | reports whether `SNOWFLAKE_ACCOUNT` is set (secrets cannot be read in a job-level `if`) |
+| `build-and-test` | only if the secret exists | key-pair login, `dbt debug`, loads a 2-day batch into RAW with `--truncate`, runs `drop_ci_schemas` then `dbt build --target ci --full-refresh`, `sqlfluff lint` (blocking, dbt templater), `dbt source freshness` (report only) |
 
----
+`build-and-test` sets `DBT_TARGET=ci` and `DBT_SCHEMA_SUFFIX=_CI`, so models land in
+`STAGING_CI`, `INTERMEDIATE_CI`, `MARTS_CI` and `SNAPSHOTS_CI`. `drop_ci_schemas` only drops
+schemas with that suffix and does nothing unless the target is `ci`.
 
-## 1. Generate an RSA key-pair (run locally)
+**RAW is shared.** CI truncates and reloads `LIVE_COMMERCE.RAW`; it is not suffixed. If you
+also develop locally against the same database, a CI run replaces your RAW data. Use a
+separate Snowflake database or account for CI in that case.
 
-Snowflake key-pair auth needs an **unencrypted PKCS#8** private key. In Git Bash:
+Freshness is report-only because the batch covers a fixed past window.
+
+## 1. Snowflake user and roles
+
+The CI job loads RAW (as `ROLE_LOADER` on `WH_LOAD`) and runs dbt (as `ROLE_TRANSFORMER` on
+`WH_TRANSFORM`), so its user needs both roles. `snowflake/00_setup.sql` creates them; uncomment
+the `ci_user` block in section 4 to grant them. `ROLE_TRANSFORMER` has `CREATE SCHEMA` on the
+database, which is what lets dbt create the `_CI` schemas.
+
+## 2. Key pair
+
+The `ci` profile uses `private_key_path` with no passphrase, so generate an unencrypted
+PKCS#8 key:
 
 ```bash
-# Private key (PKCS#8, unencrypted) + public key.
 openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -nocrypt -out rsa_key.p8
 openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
 ```
 
-You now have `rsa_key.p8` (private — secret) and `rsa_key.pub` (public). **Do not commit either**
-(they match the `*.key`/`*.p8` gitignore rules; double-check before any `git add`).
-
-## 2. Register the PUBLIC key on your Snowflake user
-
-Copy the public key body **without** the header/footer lines and newlines:
+Both files are gitignored (`*.p8`, `*.pub`, `rsa_key*`). Register the public key on the CI
+user:
 
 ```bash
-# Prints the key as a single line — copy the output.
-grep -v "PUBLIC KEY" rsa_key.pub | tr -d '\n'
+grep -v "PUBLIC KEY" rsa_key.pub | tr -d '\n'     # prints the key on one line
 ```
-
-Then in a Snowsight worksheet (as ACCOUNTADMIN), paste that string into:
 
 ```sql
-alter user <YOUR_SNOWFLAKE_USER> set rsa_public_key='PASTE_THE_SINGLE_LINE_KEY_HERE';
+alter user <CI_USER> set rsa_public_key = '<KEY_FROM_ABOVE>';
+desc user <CI_USER>;    -- RSA_PUBLIC_KEY_FP should now be set
 ```
 
-Verify it took:
-```sql
-desc user <YOUR_SNOWFLAKE_USER>;   -- look for RSA_PUBLIC_KEY_FP (a fingerprint) in the output
-```
+## 3. GitHub secrets
 
-## 3. Add GitHub repository Secrets
+Settings → Secrets and variables → Actions:
 
-In your repo on GitHub → **Settings → Secrets and variables → Actions → New repository secret**.
-Add these three:
-
-| Secret name | Value |
+| Secret | Value |
 |---|---|
-| `SNOWFLAKE_ACCOUNT` | your account identifier, e.g. `ORGNAME-ACCOUNTNAME` |
-| `SNOWFLAKE_USER` | your Snowflake user name |
-| `SNOWFLAKE_PRIVATE_KEY` | the **base64-encoded** `rsa_key.p8` (single line — see below) |
+| `SNOWFLAKE_ACCOUNT` | account identifier, e.g. `ORGNAME-ACCOUNTNAME` |
+| `SNOWFLAKE_USER` | the CI user |
+| `SNOWFLAKE_PRIVATE_KEY` | `rsa_key.p8`, base64-encoded on one line |
 
-The private key must be stored **base64-encoded**, not raw. A raw multiline PEM gets its
-line breaks mangled in a GitHub Secret, producing "Unable to load PEM file" in CI. base64 is
-a single line, so it round-trips intact; the workflow decodes it back to a PEM at runtime.
-
-Generate the single-line value and copy it to your clipboard (Git Bash, from repo root):
 ```bash
-base64 -w0 rsa_key.p8 | clip      # -w0 = no line wrapping (one line)
+base64 -w0 rsa_key.p8        # copy the output into the secret
 ```
-Paste that single line into the `SNOWFLAKE_PRIVATE_KEY` secret value.
 
-> The workflow writes `SNOWFLAKE_PRIVATE_KEY` to a file at runtime and points dbt's `ci`
-> target at it via `private_key_path` — the key never lands in the repo.
+A raw multi-line PEM gets mangled when stored as a secret, so the workflow stores it base64
+and decodes it to a file at runtime, then checks it with `openssl pkey`.
 
-## 4. Trigger and watch the workflow
+## 4. Branch protection
 
-Push a branch and open a PR to `main` (or use the **Actions** tab → CI → **Run workflow**).
-- **lint-and-parse** should pass immediately.
-- **build-and-test** connects with the key-pair, loads a 2-day batch, and runs `dbt build`.
-- Green check = CI is live.
+Settings → Branches → add a rule for `main`: require a pull request and require the `parse`
+and `build-and-test` checks to pass. When the secrets are missing (for example on forks),
+`build-and-test` is skipped rather than failed.
 
-## 5. Make CI block bad merges (the point of it)
+## Local development
 
-GitHub → **Settings → Branches → Add branch protection rule** for `main`:
-- ✅ Require a pull request before merging
-- ✅ Require status checks to pass → select **lint-and-parse** and **build-and-test**
-- (optional) ✅ Require branches to be up to date before merging
+`dbt/profiles.example.yml` picks the target from `DBT_TARGET` (default `dev`). `dev` uses
+password auth from `.env`. To use a key pair locally, set `SNOWFLAKE_PRIVATE_KEY_PATH`
+(and `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` if the key is encrypted, which only the loader and
+z-test support) and run dbt with `--target ci`. Without `DBT_SCHEMA_SUFFIX` that builds into
+the unsuffixed schemas.
 
-Now a PR with a failing model or test **cannot be merged** — the "CI blocks a red PR"
-guarantee. You can prove it by opening a deliberately-broken PR once.
-
----
-
-## Local dev auth (unchanged)
-
-Local development still uses **password** auth via `.env` + the `dev` target — simpler for
-interactive work. Key-pair is specifically for unattended CI. (You can also switch local dev to
-key-pair by setting `SNOWFLAKE_PRIVATE_KEY_PATH` and using `--target ci`.)
-
-## Security note
-
-Rotate any credential that has been shared or shown. To remove the CI key from
-Snowflake: `alter user <YOUR_SNOWFLAKE_USER> unset rsa_public_key;`
+To revoke the CI key: `alter user <CI_USER> unset rsa_public_key;`

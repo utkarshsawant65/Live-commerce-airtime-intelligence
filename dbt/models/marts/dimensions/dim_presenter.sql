@@ -1,9 +1,4 @@
-{#
-    dim_presenter — conformed presenter dimension, SCD Type 1 (overwrite).
-    Presenter attributes don't meaningfully change over the analysis window, so Type 1
-    is correct; Type 2 here would be over-engineering.
-    Includes the unknown member (-1) for orphan/late facts.
-#}
+{# Presenter dimension, SCD1 (overwrite), plus the unknown member (-1). #}
 
 with presenters as (
     select

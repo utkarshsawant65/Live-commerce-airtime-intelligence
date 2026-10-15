@@ -1,13 +1,6 @@
 {#
-    stg_order_lines_quarantine — the rows that failed validation in the VARIANT feed.
-
-    Bad rows are CAPTURED here (not dropped, not allowed to break the load) with the
-    reason they failed and their original payload context, so they can be inspected,
-    reported on, and backfilled once the source is fixed. A non-empty quarantine is an
-    observable data-quality signal, not a silent loss.
-
-    Deduped on order_line_id where present; rows with a null id keep all occurrences
-    (we cannot key them) so nothing is lost.
+    Rows from the VARIANT order-line feed that failed validation, with the reason.
+    Not deduplicated: every failing payload is kept for inspection.
 #}
 
 select

@@ -1,11 +1,8 @@
 {#
-    fact_returns — GRAIN: one row per returned order line.
-    Measures: returned_qty, refund_amount. Links to fact_order_line via order_line_id.
-    Table materialization (low volume).
-
-    We carry the order line's product_key/channel_key onto the return so returns can be
-    sliced by the same conformed dims without re-joining order lines downstream (the
-    return is attributed to the SAME product version / channel as the original sale).
+    One row per returned order line. Carries the sale's product_key, channel_key and
+    attributed segment so returns slice by the same dimensions as the sale.
+    Inner join: a return whose order line is not in fact_order_line is excluded
+    (stg_returns has a relationships test against stg_order_lines).
 #}
 
 with returns as (

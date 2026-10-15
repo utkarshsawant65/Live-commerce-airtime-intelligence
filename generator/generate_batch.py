@@ -1,26 +1,8 @@
 """
-Live Commerce — synthetic data generator (one batch).
+Generate one batch of synthetic live-commerce data with an airtime -> sales effect built in.
 
-Generates a self-consistent slice of a live-commerce business with a *real*
-airtime -> sales correlation baked in, so the downstream analytics (revenue per
-broadcast minute, conversion lift, return rates) produce visible, testable signal.
-
-Why synthetic: no public dataset has a broadcast/airtime dimension. By generating
-it ourselves we control the airtime -> sales correlation and can therefore prove the
-attribution model works and the statistical lift test detects a real effect.
-
-Outputs (CSV, UTC timestamps throughout) to --out:
-    dim_product.csv          one row per product per VERSION (feeds the SCD2 snapshot)
-    dim_presenter.csv        one row per presenter
-    dim_show.csv             one row per show
-    dim_channel.csv          one row per channel (also shipped as a dbt seed)
-    fact_airtime_segment.csv one row per broadcast segment
-    fact_order_line.csv      one row per product line per order
-    fact_returns.csv         one row per returned order line
-    fact_traffic.csv         one row per channel per minute
-
-Determinism: a fixed seed makes every run reproducible. The "live" loop varies the
-seed and the date window per batch so successive batches add new, non-overlapping rows.
+Writes dimension and fact CSVs (UTC timestamps), a JSON copy of the order lines for the
+VARIANT feed, and _batch_manifest.json to --out. A fixed seed makes runs reproducible.
 
 Usage:
     python generator/generate_batch.py --out generator/output
@@ -30,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -38,12 +21,8 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Business configuration — the knobs that define the simulated world.
-# ---------------------------------------------------------------------------
-
 CHANNELS = [
-    # channel_id, channel_name, channel_type — call-centre + TV + web + app (cross-channel)
+    # channel_id, channel_name, channel_type
     (1, "TV Linear", "broadcast"),
     (2, "Web Shop", "online"),
     (3, "Mobile App", "online"),
@@ -51,7 +30,7 @@ CHANNELS = [
 ]
 
 CATEGORIES = [
-    # name, base_return_rate (fashion/jewellery are heavy returners)
+    # name, base_return_rate
     ("Fashion", 0.28),
     ("Jewellery", 0.24),
     ("Beauty", 0.10),
@@ -59,8 +38,6 @@ CATEGORIES = [
     ("Electronics", 0.06),
     ("Wellness", 0.07),
 ]
-
-PRICE_BANDS = ["budget", "mid", "premium", "luxury"]
 
 SHOWS = [
     # show_name, format
@@ -73,33 +50,20 @@ SHOWS = [
 
 EXPERIENCE_TIERS = ["rookie", "established", "star"]
 
-# How strongly airtime lifts conversion, by presenter tier. A "star" presenter
-# moving product on prime time is the core live-commerce mechanic. Tuned so the
-# on-air vs off-air conversion lift lands in a believable range (tens of %, not
-# multiples) — a realistic, defensible signal rather than an implausible spike.
+# Expected airtime orders per segment minute, by presenter tier.
 TIER_LIFT_MULTIPLIER = {"rookie": 1.05, "established": 1.25, "star": 1.6}
 
-# Baseline (off-air) conversion rate: orders per session per minute, per channel.
-# The lift during airtime is applied on top of this — that gap is what the
-# two-proportion z-test (analysis/) is designed to detect.
-BASELINE_CONVERSION = {
-    "broadcast": 0.0,    # no "sessions" off-air on linear TV; TV orders ride the lift
-    "online": 0.012,
-    "phone": 0.004,
-}
-
-# Minute-level traffic baselines (concurrent viewers / web sessions) by channel type.
+# (mean, std) of concurrent viewers / sessions per minute, by channel type.
 BASELINE_TRAFFIC = {
-    "broadcast": (4000, 1200),   # (mean concurrent viewers, std)
+    "broadcast": (4000, 1200),
     "online": (900, 250),
     "phone": (120, 40),
 }
 
-# Prime-time daypart (local broadcast convention) lifts traffic AND conversion.
-PRIME_TIME_HOURS = set(range(18, 23))  # 18:00–22:59 UTC for this synthetic world
+PRIME_TIME_HOURS = set(range(18, 23))  # 18:00-22:59 UTC
 PRIME_TIME_TRAFFIC_MULT = 2.1
 
-LAG_MINUTES = 30  # realistic delay: seen-on-air -> order placed/synced (matches dbt model)
+LAG_MINUTES = 30  # must match dbt var attribution_lag_minutes
 
 
 @dataclass
@@ -117,7 +81,7 @@ class Product:
 
 
 # ---------------------------------------------------------------------------
-# Entity generation
+# Dimensions
 # ---------------------------------------------------------------------------
 
 def _band_for_price(price: float) -> str:
@@ -130,8 +94,7 @@ def _band_for_price(price: float) -> str:
     return "luxury"
 
 
-# Realistic product names by category — an adjective/material + an item noun, so the
-# dashboard reads like a real catalogue (e.g. "Cashmere Wrap Coat") instead of "Product 1".
+# (adjectives, item nouns) per category, combined into names like "Cashmere Wrap Coat".
 _NAME_PARTS = {
     "Fashion": (["Cashmere", "Merino", "Linen", "Silk", "Quilted", "Tailored", "Wrap", "Pleated"],
                 ["Wrap Coat", "Knit Sweater", "Midi Dress", "Trench Coat", "Scarf", "Blazer", "Tunic", "Cardigan"]),
@@ -149,8 +112,7 @@ _NAME_PARTS = {
 
 
 def _product_name(rng: np.random.Generator, category: str, pid: int) -> str:
-    """A realistic, category-appropriate product name. Falls back gracefully if a
-    category has no name pool. The trailing short code keeps names unique."""
+    """Random "<adjective> <item>" name for the category (not unique across products)."""
     parts = _NAME_PARTS.get(category)
     if not parts:
         return f"Item {pid}"
@@ -160,30 +122,23 @@ def _product_name(rng: np.random.Generator, category: str, pid: int) -> str:
 
 
 def build_products(rng: np.random.Generator, n_products: int, window_start: datetime) -> list[Product]:
-    """Products, some with an SCD2 version change (category reclass or price-band move)
-    that lands *before* the analysis window, so the snapshot has real history to track."""
+    """Products; ~25% get an earlier SCD2 version that expired before the window."""
     brands = ["Auriva", "Lumino", "Casa Verde", "NordTech", "Belle Maison", "PureForm"]
     products: list[Product] = []
     for pid in range(1, n_products + 1):
         category = CATEGORIES[rng.integers(0, len(CATEGORIES))][0]
         brand = brands[rng.integers(0, len(brands))]
-        # Log-normal price spread. Mean/sigma chosen so all four price bands
-        # (budget/mid/premium/luxury) get meaningful coverage across categories —
-        # a higher mean pushes a healthy share of products into premium (>=100) and
-        # luxury (>=300), so the category x price-band matrix isn't sparse.
+        # Log-normal prices; parameters chosen so every price band is well populated.
         price = float(round(np.exp(rng.normal(4.3, 1.0)), 2))
         price = min(max(price, 7.99), 1999.0)
         band = _band_for_price(price)
-        # Realistic name based on the current category; stable across this product's versions.
         name = _product_name(rng, category, pid)
 
-        # ~25% of products underwent a change before the window: a reclassification
-        # or a price-band move. That earlier version is the SCD2 "expired" row.
         changed = rng.random() < 0.25
         if changed:
             old_valid_from = (window_start - timedelta(days=120)).date().isoformat()
             change_date = (window_start - timedelta(days=30)).date().isoformat()
-            # The old version: a different category or a lower price band.
+            # Old version differs by category or by a lower price.
             if rng.random() < 0.5:
                 old_category = CATEGORIES[rng.integers(0, len(CATEGORIES))][0]
                 old_price = price
@@ -216,8 +171,6 @@ def build_presenters(rng: np.random.Generator, n: int) -> list[dict]:
              "Nina", "David", "Mara", "Paul"]
     presenters = []
     for i in range(1, n + 1):
-        tier = EXPERIENCE_TIERS[min(int(rng.integers(0, 3) + rng.integers(0, 2)) // 1, 2)]
-        # weight toward 'established'
         tier = rng.choice(EXPERIENCE_TIERS, p=[0.3, 0.5, 0.2])
         presenters.append({
             "presenter_id": i,
@@ -233,7 +186,7 @@ def build_shows() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Airtime schedule — the broadcast plan that everything else correlates to.
+# Facts
 # ---------------------------------------------------------------------------
 
 def build_airtime_segments(
@@ -243,18 +196,16 @@ def build_airtime_segments(
     shows: list[dict],
     window_start: datetime,
     days: int,
+    segment_seq_start: int = 0,
 ) -> list[dict]:
-    """A broadcast schedule: each day has shows; each show airs a sequence of
-    products in back-to-back segments. A segment = one product featured in one
-    continuous on-air window. Always aired on the broadcast (TV) channel."""
+    """Broadcast schedule: 3-5 shows a day, each a run of back-to-back product segments on TV."""
     current_products = [p for p in products if p.is_current]
     segments: list[dict] = []
-    seg_id = 0
+    seg_id = segment_seq_start
     tv_channel_id = 1
 
     for d in range(days):
         day = window_start + timedelta(days=d)
-        # 3–5 shows per day, spread across the broadcast day, biased to prime time.
         n_shows = int(rng.integers(3, 6))
         show_start_hours = sorted(rng.choice(
             list(range(8, 23)), size=n_shows, replace=False,
@@ -264,7 +215,7 @@ def build_airtime_segments(
             show = shows[rng.integers(0, len(shows))]
             presenter = presenters[rng.integers(0, len(presenters))]
             cursor = day.replace(hour=int(sh), minute=0, second=0, microsecond=0)
-            # A show runs 60–120 min, filled with 5–14 min product segments.
+            # 60-120 minute show made of 5-14 minute segments.
             show_minutes = int(rng.integers(60, 121))
             elapsed = 0
             while elapsed < show_minutes - 5:
@@ -295,20 +246,13 @@ def _hour_weights() -> np.ndarray:
     return w / w.sum()
 
 
-# ---------------------------------------------------------------------------
-# Traffic — the conversion denominator. Rises during airtime (and prime time),
-# so the lift the orders show up against is a real rate change, not just volume.
-# ---------------------------------------------------------------------------
-
 def build_traffic(
     rng: np.random.Generator,
     segments: list[dict],
     window_start: datetime,
     days: int,
 ) -> list[dict]:
-    """One row per channel per minute. Online/app/phone traffic gets an additive
-    bump during any active TV segment (cross-channel halo of going on air)."""
-    # Pre-index minutes that are "on air" so we can apply the halo.
+    """One row per channel per minute; online traffic gets a halo while any segment is on air."""
     on_air_minutes: set[int] = set()
     for s in segments:
         st = _parse(s["start_ts_utc"])
@@ -328,16 +272,15 @@ def build_traffic(
             mult = PRIME_TIME_TRAFFIC_MULT if prime else 1.0
             halo = 1.0
             if ch_type == "online" and (int(minute.timestamp()) // 60) in on_air_minutes:
-                halo = 1.8  # cross-channel halo: TV airing drives web/app traffic
+                halo = 2.9
             mean = base_v * mult * halo
             viewers = max(0, int(rng.normal(mean, base_std)))
-            # web_sessions: for online channels viewers ~= sessions; broadcast has
-            # "viewers" but no web sessions; phone has call volume as sessions.
+            # Online: sessions == visitors. Phone: call volume. Broadcast: no sessions.
             if ch_type == "online":
                 sessions = viewers
             elif ch_type == "phone":
                 sessions = max(0, int(viewers))
-            else:  # broadcast: concurrent viewers, sessions n/a (0)
+            else:
                 sessions = 0
             rows.append({
                 "channel_id": ch_id,
@@ -348,23 +291,16 @@ def build_traffic(
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Orders — the core correlation. Most orders happen inside a product's airtime
-# window (+lag), on channels other than TV, scaled by presenter tier and traffic.
-# A baseline trickle of organic orders happens off-air -> attributed to segment -1.
-# ---------------------------------------------------------------------------
-
 def build_orders_and_returns(
     rng: np.random.Generator,
     products: list[Product],
     presenters: list[dict],
     segments: list[dict],
-    traffic_index: dict[tuple[int, int], int],
     window_start: datetime,
     days: int,
     order_seq_start: int,
 ) -> tuple[list[dict], list[dict]]:
-    """Returns (order_lines, returns)."""
+    """Airtime-driven orders per segment plus a uniform off-air baseline. Returns (order_lines, returns)."""
     presenter_tier = {p["presenter_id"]: p["experience_tier"] for p in presenters}
     cat_return_rate = dict(CATEGORIES)
     current_by_id = {p.product_id: p for p in products if p.is_current}
@@ -377,7 +313,6 @@ def build_orders_and_returns(
     line_id = order_seq_start * 4
     return_id = order_seq_start * 2
 
-    # --- Airtime-driven orders -------------------------------------------------
     for seg in segments:
         product = current_by_id.get(seg["product_id"])
         if product is None:
@@ -385,22 +320,20 @@ def build_orders_and_returns(
         tier = presenter_tier[seg["presenter_id"]]
         lift = TIER_LIFT_MULTIPLIER[tier]
         st = _parse(seg["start_ts_utc"])
-        en = _parse(seg["end_ts_utc"])
         prime = st.hour in PRIME_TIME_HOURS
-        # Expected orders this segment: duration * lift * prime bump * price-attractiveness.
         price_factor = np.clip(2.0 - (product.list_price / 400.0), 0.4, 1.8)
         expected = (seg["segment_duration_minutes"] * lift
                     * (1.6 if prime else 1.0) * price_factor * rng.uniform(0.8, 1.2))
         n_orders = int(rng.poisson(max(expected, 0.1)))
 
         for _ in range(n_orders):
-            # Order time: inside [start, end+lag], front-loaded (most buy while it airs).
+            # Front-loaded order time, capped one minute inside the half-open
+            # [start, end + lag) window so every airtime order attributes.
             offset = min(
                 rng.exponential(seg["segment_duration_minutes"] * 0.6),
-                seg["segment_duration_minutes"] + LAG_MINUTES,
+                seg["segment_duration_minutes"] + LAG_MINUTES - 1,
             )
             ts = st + timedelta(minutes=float(offset))
-            # Channel: airtime drives phone + online; TV itself takes call-centre orders.
             channel_id = int(rng.choice(online_channels + [tv_channel_id],
                                         p=_order_channel_probs(len(online_channels))))
             order_id += 1
@@ -410,10 +343,7 @@ def build_orders_and_returns(
             _maybe_return(rng, ol, product, cat_return_rate, returns, return_id_ref := [return_id])
             return_id = return_id_ref[0]
 
-    # --- Organic / baseline orders (off-air) -> will attribute to segment -1 ----
-    # A steady baseline of organic demand across online channels, independent of
-    # airtime. Sized so off-air conversion is a realistic baseline and the on-air
-    # lift over it lands in a believable tens-of-percent range (not a 20x spike).
+    # Organic orders spread uniformly over the window, independent of airtime.
     n_organic = int(days * 24 * 60 * 0.13 * len(online_channels))
     current_products = list(current_by_id.values())
     for _ in range(n_organic):
@@ -432,7 +362,7 @@ def build_orders_and_returns(
 
 
 def _order_channel_probs(n_online: int) -> list[float]:
-    # online/phone channels share most weight; TV (call-centre proxy) gets the rest.
+    # Non-TV channels share 85%; TV (call-in orders) takes the remaining 15%.
     base = [0.55, 0.30][:n_online]
     if len(base) < n_online:
         base += [0.10] * (n_online - len(base))
@@ -443,7 +373,6 @@ def _order_channel_probs(n_online: int) -> list[float]:
 
 def _make_order_line(rng, line_id, order_id, product: Product, channel_id, ts) -> dict:
     qty = int(rng.choice([1, 1, 1, 2, 2, 3], p=[0.45, 0.2, 0.1, 0.13, 0.07, 0.05]))
-    # Paid price varies around list price (promotions) — this lives in the FACT.
     unit_price_paid = round(product.list_price * rng.uniform(0.7, 1.0), 2)
     gross = round(unit_price_paid * qty, 2)
     discount = round(gross * rng.uniform(0.0, 0.15), 2)
@@ -464,14 +393,12 @@ def _make_order_line(rng, line_id, order_id, product: Product, channel_id, ts) -
 
 def _maybe_return(rng, ol: dict, product: Product, cat_return_rate, returns: list, return_id_ref: list):
     rate = cat_return_rate.get(product.category, 0.1)
-    # luxury/premium return a bit more (fit/expectation gap).
     if product.list_price_band in ("premium", "luxury"):
         rate *= 1.2
     if rng.random() < rate:
         returned_qty = int(rng.integers(1, ol["quantity"] + 1))
         refund = round(ol["net_amount"] * (returned_qty / ol["quantity"]), 2)
         return_id_ref[0] += 1
-        # Return happens 1–21 days after the order.
         ret_ts = _parse(ol["event_ts_utc"]) + timedelta(days=float(rng.uniform(1, 21)))
         reason = str(rng.choice(
             ["size_fit", "not_as_described", "changed_mind", "damaged", "late_delivery"],
@@ -509,75 +436,50 @@ def _write_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dirty-data injection (production-realism mode)
+# Dirty-data injection
 # ---------------------------------------------------------------------------
 
-def inject_dirt(rng: np.random.Generator, order_lines: list[dict], traffic: list[dict],
+def inject_dirt(rng: np.random.Generator, order_lines: list[dict],
                 n_products: int, dirty_rate: float) -> dict:
-    """Corrupt a fraction of rows the way real multi-source feeds do, so the pipeline can
-    PROVE it survives the worst case rather than assuming clean input. Returns a manifest
-    of exactly what was injected, so tests and docs can assert the pipeline handled it.
+    """Corrupt the JSON order-line feed in place and return a manifest of what was injected.
 
-    Each dirt type maps to a downstream defence:
-      duplicate row      -> staging dedup (row_number) + uniqueness test
-      null required key  -> not_null test fires / staging filters
-      bad numeric type   -> VARIANT schema-on-read + try_cast in staging
-      orphan FK          -> unknown member (-1) + relationships test
-      out-of-order/late  -> incremental lookback re-attribution
-      whitespace/case    -> trim()/lower() in staging
+    Each corruption hits its own disjoint set of rows, so the counts are exact:
+      duplicate_order_lines    exact copies appended    -> quarantine (duplicate_order_line)
+      null_product_id          product_id = null        -> quarantine
+      bad_quantity_type        quantity = "N/A", ...    -> try_cast + quarantine
+      orphan_product_id        unknown product_id       -> quarantine (unknown_product_id)
+      out_of_order_timestamps  event time 2-10 days earlier; well-formed, so stays valid
     """
     if not order_lines:
         return {"injected": False}
 
-    manifest: dict = {"injected": True, "dirty_rate": dirty_rate, "types": {}}
     n = len(order_lines)
     k = max(1, int(n * dirty_rate))
+    kinds = ["duplicate_order_lines", "null_product_id", "bad_quantity_type",
+             "orphan_product_id", "out_of_order_timestamps"]
+    k = min(k, n // len(kinds))
+    picked = rng.permutation(n)[:k * len(kinds)]
+    idx = {kind: picked[j * k:(j + 1) * k] for j, kind in enumerate(kinds)}
 
-    def sample_indices(count: int) -> list[int]:
-        return list(rng.choice(n, size=min(count, n), replace=False))
-
-    # 1. Duplicate rows (exact dupes appended) — same order_line_id reused.
-    dup_src = sample_indices(k)
-    dupes = [dict(order_lines[i]) for i in dup_src]
-    order_lines.extend(dupes)
-    manifest["types"]["duplicate_order_lines"] = len(dupes)
-
-    # 2. Null in a required field (product_id) on some rows.
-    null_idx = sample_indices(k)
-    for i in null_idx:
-        order_lines[i]["product_id"] = ""
-    manifest["types"]["null_product_id"] = len(null_idx)
-
-    # 3. Bad numeric type — quantity as a junk string (un-parseable).
-    bad_idx = sample_indices(k)
-    for i in bad_idx:
-        order_lines[i]["quantity"] = rng.choice(["N/A", "two", "-", "??"])
-    manifest["types"]["bad_quantity_type"] = len(bad_idx)
-
-    # 4. Orphan FK — product_id that does not exist in dim_product.
-    orphan_idx = sample_indices(k)
-    for i in orphan_idx:
+    dupes = [dict(order_lines[i]) for i in idx["duplicate_order_lines"]]
+    for i in idx["null_product_id"]:
+        order_lines[i]["product_id"] = None
+    for i in idx["bad_quantity_type"]:
+        order_lines[i]["quantity"] = str(rng.choice(["N/A", "two", "-", "??"]))
+    for i in idx["orphan_product_id"]:
         order_lines[i]["product_id"] = n_products + 9999
-    manifest["types"]["orphan_product_id"] = len(orphan_idx)
-
-    # 5. Out-of-order / late timestamps — shift some events far back/forward.
-    late_idx = sample_indices(k)
-    for i in late_idx:
+    for i in idx["out_of_order_timestamps"]:
         ts = _parse(order_lines[i]["event_ts_utc"])
         order_lines[i]["event_ts_utc"] = _iso(ts - timedelta(days=float(rng.uniform(2, 10))))
-    manifest["types"]["out_of_order_timestamps"] = len(late_idx)
+    order_lines.extend(dupes)
 
-    # 6. Whitespace / case noise on a categorical-ish field (channel left as id, so use
-    #    reason-style noise on net_amount formatting is risky; instead pad order_id text).
-    #    Apply whitespace to the traffic web_sessions occasionally as stringy noise.
-    if traffic:
-        tn = len(traffic)
-        tk = max(1, int(tn * dirty_rate * 0.5))
-        for i in rng.choice(tn, size=min(tk, tn), replace=False):
-            traffic[i]["web_sessions"] = f"  {traffic[i]['web_sessions']} "
-        manifest["types"]["whitespace_web_sessions"] = int(min(tk, tn))
-
-    return manifest
+    return {
+        "injected": True,
+        "dirty_rate": dirty_rate,
+        "feed": "fact_order_line.json",
+        "json_rows": len(order_lines),
+        "types": {kind: int(len(rows)) for kind, rows in idx.items()},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -586,27 +488,39 @@ def inject_dirt(rng: np.random.Generator, order_lines: list[dict], traffic: list
 
 def generate(out_dir: str, start: datetime, days: int, seed: int,
              n_products: int, n_presenters: int, order_seq_start: int,
-             dirty: bool = False, dirty_rate: float = 0.02) -> dict:
-    rng = np.random.default_rng(seed)
-    os.makedirs(out_dir, exist_ok=True)
+             dirty: bool = False, dirty_rate: float = 0.02,
+             segment_seq_start: int = 0, dim_seed: int | None = None,
+             dim_start: datetime | None = None) -> dict:
+    """Generate one batch into out_dir and return its manifest.
 
-    products = build_products(rng, n_products, start)
-    presenters = build_presenters(rng, n_presenters)
+    dim_seed / dim_start fix the dimension tables independently of the fact seed and
+    window, so successive live batches describe the same products and presenters.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    if dim_seed is None:
+        dim_seed = seed
+    dim_rng = np.random.default_rng(dim_seed)
+    products = build_products(dim_rng, n_products, dim_start or start)
+    presenters = build_presenters(dim_rng, n_presenters)
     shows = build_shows()
-    segments = build_airtime_segments(rng, products, presenters, shows, start, days)
+    # With a single seed, keep one RNG stream so standalone output stays reproducible.
+    rng = dim_rng if dim_seed == seed else np.random.default_rng(seed)
+
+    segments = build_airtime_segments(rng, products, presenters, shows, start, days,
+                                      segment_seq_start)
     traffic = build_traffic(rng, segments, start, days)
-    # index not strictly needed downstream but kept for future conversion shaping
     order_lines, returns = build_orders_and_returns(
-        rng, products, presenters, segments, {}, start, days, order_seq_start,
+        rng, products, presenters, segments, start, days, order_seq_start,
     )
 
-    # Production-realism: optionally corrupt a fraction of rows so the pipeline must
-    # prove it handles dirty multi-source data, not just the happy path.
+    # Dirt goes only into the JSON feed (landed as VARIANT); the typed CSVs stay clean
+    # so a strict COPY INTO never aborts on them.
+    json_order_lines = order_lines
     dirt_manifest = {"injected": False}
     if dirty:
-        dirt_manifest = inject_dirt(rng, order_lines, traffic, n_products, dirty_rate)
+        json_order_lines = copy.deepcopy(order_lines)
+        dirt_manifest = inject_dirt(rng, json_order_lines, n_products, dirty_rate)
 
-    # dim_channel ships as a dbt seed too, but write here for completeness.
     channels = [{"channel_id": c, "channel_name": n, "channel_type": t} for c, n, t in CHANNELS]
 
     _write_csv(os.path.join(out_dir, "dim_product.csv"),
@@ -625,11 +539,8 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
     _write_csv(os.path.join(out_dir, "fact_order_line.csv"), order_lines,
                ["order_line_id", "order_id", "product_id", "channel_id", "event_ts_utc",
                 "quantity", "unit_price_paid", "gross_amount", "discount_amount", "net_amount"])
-    # Also emit order lines as semi-structured JSON — simulating an event/app feed that
-    # arrives without a schema guarantee. The loader lands this as VARIANT (schema-on-read)
-    # so a source field change never breaks the load; staging parses + quarantines.
     with open(os.path.join(out_dir, "fact_order_line.json"), "w", encoding="utf-8") as jf:
-        json.dump(order_lines, jf)
+        json.dump(json_order_lines, jf)
     _write_csv(os.path.join(out_dir, "fact_returns.csv"), returns,
                ["return_id", "order_line_id", "returned_qty", "refund_amount",
                 "return_ts_utc", "reason_code"])
@@ -640,6 +551,7 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
         "window_start_utc": _iso(start),
         "days": days,
         "seed": seed,
+        "dim_seed": dim_seed,
         "counts": {
             "products_versions": len(products),
             "presenters": len(presenters),
@@ -651,6 +563,7 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
         },
         "max_order_id": max((o["order_id"] for o in order_lines), default=order_seq_start),
         "max_order_line_id": max((o["order_line_id"] for o in order_lines), default=order_seq_start * 4),
+        "max_segment_id": max((s["segment_id"] for s in segments), default=segment_seq_start),
         "dirty_data": dirt_manifest,
     }
     with open(os.path.join(out_dir, "_batch_manifest.json"), "w", encoding="utf-8") as f:
@@ -663,22 +576,25 @@ def main() -> None:
     ap.add_argument("--out", default="generator/output", help="output directory")
     ap.add_argument("--start", default="2026-06-10", help="window start date (UTC, YYYY-MM-DD)")
     ap.add_argument("--days", type=int, default=5, help="number of days to generate")
-    ap.add_argument("--seed", type=int, default=42, help="RNG seed (reproducibility)")
+    ap.add_argument("--seed", type=int, default=42, help="RNG seed")
     ap.add_argument("--products", type=int, default=120, help="number of products")
     ap.add_argument("--presenters", type=int, default=10, help="number of presenters")
     ap.add_argument("--order-seq-start", type=int, default=0,
-                    help="starting id offset (the live loop bumps this so batches don't collide)")
+                    help="order id offset; ids start at this value + 1")
+    ap.add_argument("--segment-seq-start", type=int, default=0,
+                    help="segment id offset; ids start at this value + 1")
     ap.add_argument("--dirty", action="store_true",
-                    help="inject realistic dirty data (dupes, nulls, bad types, orphans, "
-                         "out-of-order timestamps) so the pipeline must prove it handles the worst case")
+                    help="inject duplicates, nulls, bad types, orphan keys and late timestamps "
+                         "into the JSON order-line feed")
     ap.add_argument("--dirty-rate", type=float, default=0.02,
-                    help="fraction of rows to corrupt when --dirty is set (default 2%%)")
+                    help="fraction of rows per corruption type when --dirty is set (default 2%%)")
     args = ap.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     summary = generate(args.out, start, args.days, args.seed,
                        args.products, args.presenters, args.order_seq_start,
-                       dirty=args.dirty, dirty_rate=args.dirty_rate)
+                       dirty=args.dirty, dirty_rate=args.dirty_rate,
+                       segment_seq_start=args.segment_seq_start)
     print(json.dumps(summary, indent=2))
 
 

@@ -1,9 +1,7 @@
-# Copy to ~/.dbt/profiles.yml (or set DBT_PROFILES_DIR to the dbt/ folder and
-# name it profiles.yml). The real profiles.yml is gitignored — never commit secrets.
-#
-# Auth: password for local dev; key-pair (private_key_path) is preferred for CI.
+# Copy to ~/.dbt/profiles.yml, or to dbt/profiles.yml (gitignored).
+# dev uses password auth; ci uses key-pair auth.
 live_commerce:
-  target: dev
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
   outputs:
     dev:
       type: snowflake
@@ -13,7 +11,7 @@ live_commerce:
       role: ROLE_TRANSFORMER
       warehouse: WH_TRANSFORM
       database: LIVE_COMMERCE
-      schema: MARTS            # default schema; models route to their own via +schema
+      schema: MARTS            # fallback only; every layer sets its own +schema
       threads: 4
       client_session_keep_alive: false
 
@@ -21,7 +19,6 @@ live_commerce:
       type: snowflake
       account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
       user: "{{ env_var('SNOWFLAKE_USER') }}"
-      # CI uses key-pair auth (no interactive password).
       private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
       role: ROLE_TRANSFORMER
       warehouse: WH_TRANSFORM

@@ -1,8 +1,4 @@
-{#
-    Staging: airtime segments. 1:1, typed, deduped on segment_id.
-    Timestamps stay UTC (TIMESTAMP_NTZ holding UTC values) — no zone conversion
-    until the BI layer.
-#}
+{# Airtime segments, deduped on segment_id. Timestamps are UTC (TIMESTAMP_NTZ). #}
 
 with source as (
     select * from {{ source('raw', 'fact_airtime_segment') }}
@@ -13,7 +9,7 @@ deduped as (
         *,
         row_number() over (
             partition by segment_id
-            order by loaded_at_utc desc
+            order by loaded_at_utc desc, end_ts_utc desc
         ) as _row_num
     from source
 )

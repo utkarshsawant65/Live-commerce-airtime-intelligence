@@ -1,7 +1,3 @@
-# Personal / local-only notes — never publish
-about-me.md
-root/
-
 # Python
 __pycache__/
 *.py[cod]
@@ -10,7 +6,7 @@ venv/
 env/
 *.egg-info/
 
-# Generated data (keep the generator, not its output)
+# Generated data (seeds are versioned)
 generator/output/
 *.csv
 *.json
@@ -22,15 +18,17 @@ dbt/dbt_packages/
 dbt/logs/
 dbt/.user.yml
 
-# Secrets / credentials — never commit
+# Credentials
 profiles.yml
 .env
+.env.*
+!.env.example
 *.key
 *.p8
 *.pub
 rsa_key*
 
-# Power BI working files (the .pbix can be large; keep a documented export instead)
+# Power BI working files
 *.pbix
 
 # OS / editor
@@ -38,3 +36,4 @@ rsa_key*
 Thumbs.db
 .vscode/
 .idea/
+.claude/

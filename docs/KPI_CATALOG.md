@@ -1,82 +1,77 @@
 # KPI Catalog
 
-The single source of truth for every KPI in this project. Each KPI is defined **once**
-in the dbt marts layer (primarily [`mart_kpi_metrics`](../dbt/models/marts/mart_kpi_metrics.sql),
-[`mart_segment_performance`](../dbt/models/marts/mart_segment_performance.sql), and
-[`mart_conversion_windows`](../dbt/models/marts/mart_conversion_windows.sql)) and consumed by
-Power BI without re-derivation. This is the mechanism that stops two reports from
-disagreeing on "revenue": one definition, tested and documented, BI reads marts only.
+Each KPI is defined once in the dbt marts and read by Power BI without being re-derived:
+[`mart_kpi_metrics`](../dbt/models/marts/mart_kpi_metrics.sql),
+[`mart_segment_performance`](../dbt/models/marts/mart_segment_performance.sql) and
+[`mart_conversion_windows`](../dbt/models/marts/mart_conversion_windows.sql).
 
-**Conventions**
-- All monetary values are in the shop's reporting currency; all timestamps are UTC,
-  converted only at the BI layer.
-- *Additive* base measures (sums, counts) are stored at the mart grain and roll up to any
-  dimension by `SUM`. *Ratio* KPIs are computed from those base measures at query time
-  (a Power BI measure), never stored pre-divided at a grain that would break roll-ups.
-- ⭐ marks the hero KPIs that make this a live-commerce product.
+Conventions:
+- Timestamps are UTC throughout the warehouse.
+- Marts store additive base measures. Ratios are computed in BI from summed numerators and
+  denominators, never stored pre-divided at a grain where they would not roll up.
 
----
+## Base measures: `mart_kpi_metrics`
 
-## Base measures — `mart_kpi_metrics`
+Grain: `event_date` × `product_key` × `presenter_key` × `channel_key` × `attributed_segment_id`.
+The presenter is the attributed segment's presenter; organic orders get the unknown presenter.
+Returns are aligned to the date and keys of the original sale.
 
-Grain: one row per (`event_date`, `product_key`, `presenter_key`, `channel_key`,
-`attributed_segment_id`). Every KPI below rolls up to any of those dimensions.
-
-| KPI | Formula | Type | Reported grain |
+| KPI | Column | Formula | Additivity |
 |---|---|---|---|
-| **GMV** | `Σ gross_amount` | additive | any dimension |
-| **Discounts** | `Σ discount_amount` | additive | any dimension |
-| **Returns Refund** | `Σ refund_amount` (returns aligned to the sale) | additive | any dimension |
-| **Net Revenue after Returns** | `GMV − Discounts − Returns Refund` | additive | show / presenter / channel / category |
-| **Units Sold** | `Σ quantity` | additive | any dimension |
-| **Returned Units** | `Σ returned_qty` | additive | product / presenter / category / channel |
-| **Distinct Orders** | `COUNT(DISTINCT order_id)` | semi-additive | channel / show |
-| **Airtime-Attributed Revenue** | `Σ net_amount WHERE is_airtime_attributed` | additive | segment / presenter |
+| GMV | `gmv` | `Σ gross_amount` | additive |
+| Discounts | `discounts` | `Σ discount_amount` | additive |
+| Returns refund | `returns_refund` | `Σ refund_amount` | additive |
+| Net revenue after returns | `net_revenue_after_returns` | `GMV − Discounts − Returns refund` | additive |
+| Total net revenue | `total_net_revenue` | `Σ net_amount` (before returns) | additive |
+| Airtime-attributed revenue | `airtime_attributed_revenue` | `Σ net_amount where is_airtime_attributed` | additive |
+| Units sold | `units_sold` | `Σ quantity` | additive |
+| Returned units | `returned_units` | `Σ returned_qty` | additive |
+| Distinct orders | `distinct_orders` | `COUNT(DISTINCT order_id)` | not additive across products (a multi-product order appears in several rows) |
 
-### Ratio KPIs derived from the base measures
+`is_airtime_attributed` comes from the attribution model: the order line matched a segment
+for its own product within `[start, end + 30 min)`.
 
-| KPI | Formula | Reported grain | Notes / filters |
-|---|---|---|---|
-| **AOV** (avg order value) | `Net Revenue after Returns ÷ Distinct Orders` | channel / show | guard `Distinct Orders > 0` |
-| **Return Rate** | `Returned Units ÷ Units Sold` | product / presenter / category / channel | always in `[0, 1]` (enforced by a singular test) |
-| **Airtime-Attributed Revenue Share** | `Airtime-Attributed Revenue ÷ Net Revenue` | segment / presenter | share of revenue the airtime drove |
+### Ratios (computed in BI)
 
----
+| KPI | Formula | Notes |
+|---|---|---|
+| AOV | `Net revenue after returns ÷ Distinct orders` | guard against zero orders; distinct orders should be counted from `fact_order_line` when slicing across products |
+| Return rate | `Returned units ÷ Units sold` | in `[0, 1]`; a singular test checks returns never exceed sales per line |
+| Airtime revenue share | `Airtime-attributed revenue ÷ Total net revenue` | share of revenue tied to a segment |
 
-## Hero KPIs
+## Revenue per broadcast minute: `mart_segment_performance`
 
-### ⭐ Revenue per Broadcast Minute — `mart_segment_performance`
-
-Grain: one row per **airtime segment**.
+Grain: one row per segment (`segment_id`).
 
 | | |
 |---|---|
-| **Formula** | `attributed_revenue ÷ segment_duration_minutes` |
-| **Reported grain** | segment / presenter / product / show |
-| **Filters** | airtime-attributed revenue only; guard `segment_duration_minutes > 0` |
-| **Why it matters** | The core efficiency metric of live commerce: which product × presenter × time window earns the most per minute of air. |
+| Formula | `attributed_revenue ÷ segment_duration_minutes` |
+| Inputs | net revenue, orders and units of order lines attributed to the segment |
+| Rolls up | sum `attributed_revenue` and `segment_duration_minutes` first, then divide (by presenter, product, show, daypart, date) |
 
-### ⭐ Conversion Rate & Conversion Lift — `mart_conversion_windows`
+## Conversion rate and lift: `mart_conversion_windows`
 
-Grain: one row per **airtime_state** (`on_air` / `off_air`).
+Grain: `airtime_state` × `event_date` × `channel_key` × `daypart`.
 
 | | |
 |---|---|
-| **Conversion Rate** | `orders ÷ web_sessions` (per state; online channels only) |
-| **Conversion Lift (absolute)** | `conversion_rate(on_air) − conversion_rate(off_air)` |
-| **Conversion Lift (relative)** | `conversion_rate(on_air) ÷ conversion_rate(off_air) − 1` |
-| **Reported grain** | population (on-air vs off-air) |
-| **Filters** | online channels with `web_sessions > 0` (broadcast has viewers, not sessions) |
-| **Statistical backing** | A two-proportion z-test ([`analysis/conversion_lift_test.py`](../analysis/conversion_lift_test.py)) tests whether the on-air lift is significant. The dashboard and the test read the same counts. |
+| Scope | online channels only (Web Shop, Mobile App), for both orders and sessions |
+| On-air rule | a minute is `on_air` if it falls in any segment's window `[start, end + 30 min)`; otherwise `off_air`. Orders take the state of their order minute. |
+| Orders | distinct `order_id` |
+| Conversion rate | `Σ orders ÷ Σ web_sessions` per state (sum before dividing) |
+| Absolute lift | `rate(on_air) − rate(off_air)` |
+| Relative lift | `rate(on_air) ÷ rate(off_air) − 1` |
+| Significance | one-sided two-proportion z-test in [`analysis/conversion_lift_test.py`](../analysis/conversion_lift_test.py), on the same counts |
 
----
+This on-air rule is about time, not product: any segment makes the minute on air. It is
+separate from `is_airtime_attributed`, which ties an order to its own product's segment and
+drives attributed revenue.
 
-## Governance notes
+## Governance
 
-- **One tool reads these:** Power BI connects to `MARTS` only. No DAX re-implements a KPI
-  formula that belongs in dbt.
-- **Tested:** every base measure has dbt tests (not-null, non-negative ranges, referential
-  integrity to the conformed dimensions); business invariants (return rate ≤ 1, no future
-  attribution) are enforced by singular tests.
-- **Conformed dimensions:** `product`, `presenter`, `channel`, `show`, `date`, `time_minute`
-  are shared across all marts, so a slice means the same thing in every report.
+- Power BI connects to `MARTS` only and does not re-implement these formulas beyond the
+  ratios above.
+- Base measures are covered by dbt tests (not-null, ranges, relationships to the conformed
+  dimensions), plus singular tests for returns and attribution.
+- `product`, `presenter`, `channel`, `show`, `date` and `time_minute` are conformed across all
+  facts and marts.
