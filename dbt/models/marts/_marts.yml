@@ -3,10 +3,8 @@ version: 2
 models:
   - name: mart_kpi_metrics
     description: >
-      The single governed KPI surface — one definition per KPI. GRAIN: one row per
-      (event_date, product_key, presenter_key, channel_key, attributed_segment_id).
-      Additive base measures roll up to any dimension by SUM; ratios are derived in BI.
-      BI consumes this model; it never re-derives KPI logic.
+      Additive KPI base measures at event_date x product_key x presenter_key x channel_key
+      x attributed_segment_id. Ratios are derived in BI.
     columns:
       - name: event_date
         data_tests: [not_null]
@@ -54,9 +52,7 @@ models:
               [event_date, product_key, presenter_key, channel_key, attributed_segment_id]
 
   - name: mart_segment_performance
-    description: >
-      Hero mart. GRAIN: one row per airtime segment. Carries the live-commerce headline
-      KPIs: revenue_per_broadcast_minute, attributed_revenue, attributed_orders.
+    description: "One row per airtime segment with attributed orders, revenue and revenue per broadcast minute."
     columns:
       - name: segment_id
         data_tests: [not_null, unique]
@@ -91,12 +87,12 @@ models:
 
   - name: mart_conversion_windows
     description: >
-      Conversion rate + lift surface. GRAIN: one row per
-      (airtime_state, event_date, channel_key, daypart). Additive orders + web_sessions
-      roll up to any of those dims; the rate is computed in BI/DAX via DIVIDE(SUM(orders),
-      SUM(web_sessions)). Feeds the dashboard; the z-test re-aggregates to the two states.
+      Orders and web sessions on online channels at airtime_state x event_date x
+      channel_key x daypart. A minute is on_air if it falls in any segment's window
+      [start_ts_utc, end_ts_utc + attribution_lag_minutes).
     columns:
       - name: airtime_state
+        description: on_air or off_air, by the minute of the order or traffic row.
         data_tests:
           - not_null
           - accepted_values:
@@ -105,6 +101,7 @@ models:
       - name: event_date
         data_tests: [not_null]
       - name: channel_key
+        description: Online channels only.
         data_tests:
           - not_null
           - relationships:
@@ -118,6 +115,7 @@ models:
               arguments:
                 values: [morning, afternoon, prime_time, late_night]
       - name: orders
+        description: Distinct orders placed in the slice.
         data_tests:
           - not_null
           - dbt_utils.accepted_range:
@@ -131,6 +129,8 @@ models:
               arguments:
                 min_value: 0
                 inclusive: true
+      - name: conversion_rate
+        description: orders / web_sessions for the row; null when there are no sessions. Do not average across rows.
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments:

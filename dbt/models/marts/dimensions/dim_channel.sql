@@ -1,7 +1,4 @@
-{#
-    dim_channel — conformed channel dimension, static (from the governed seed).
-    Includes the unknown member (-1) for orphan/late facts.
-#}
+{# Channel dimension from seed_channel, plus the unknown member (-1). #}
 
 with channels as (
     select

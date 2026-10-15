@@ -2,18 +2,15 @@ version: 2
 
 models:
   - name: fact_order_line
-    description: >
-      GRAIN: one row per product line per order. The high-volume fact (incremental,
-      merge on order_line_id with a lookback re-attribution window). Transaction price
-      and monetary measures live here, not in any dimension.
+    description: "One row per product line per order. Incremental (merge on order_line_id)."
     columns:
       - name: order_line_id
-        description: Degenerate key — natural grain of the fact.
+        description: Degenerate key; the grain of the fact.
         data_tests: [not_null, unique]
       - name: order_id
         data_tests: [not_null]
       - name: product_key
-        description: Point-in-time surrogate FK to dim_product (version valid at event time).
+        description: FK to the dim_product version valid at event_ts_utc.
         data_tests:
           - not_null
           - relationships:
@@ -28,7 +25,10 @@ models:
                 to: ref('dim_channel')
                 field: channel_key
       - name: attributed_segment_id
-        description: FK to fact_airtime_segment.segment_id, or -1 for organic/baseline.
+        description: FK to fact_airtime_segment.segment_id, or -1 for organic.
+        data_tests: [not_null]
+      - name: event_ts_utc
+        description: Order time (UTC).
         data_tests: [not_null]
       - name: quantity
         data_tests:
@@ -46,11 +46,11 @@ models:
                 inclusive: true
       - name: is_airtime_attributed
         data_tests: [not_null]
+      - name: loaded_at_utc
+        description: When the source row was loaded into RAW; drives the incremental filter.
 
   - name: fact_airtime_segment
-    description: >
-      GRAIN: one row per broadcast segment (a product featured in one continuous on-air
-      window). Measure: segment_duration_minutes (denominator for revenue-per-minute).
+    description: "One row per broadcast segment (one product on air in one continuous window)."
     columns:
       - name: segment_id
         data_tests: [not_null, unique]
@@ -98,12 +98,12 @@ models:
                 inclusive: true
 
   - name: fact_returns
-    description: "GRAIN: one row per returned order line. Measures: returned_qty, refund_amount."
+    description: "One row per returned order line."
     columns:
       - name: return_id
         data_tests: [not_null, unique]
       - name: order_line_id
-        description: FK to fact_order_line (every return points at a real sold line).
+        description: FK to fact_order_line.
         data_tests:
           - not_null
           - relationships:
@@ -133,9 +133,7 @@ models:
                 inclusive: true
 
   - name: fact_traffic
-    description: >
-      GRAIN: one row per channel per minute. Measures: concurrent_viewers, web_sessions.
-      The conversion denominator.
+    description: "One row per channel per minute: concurrent viewers and web sessions."
     columns:
       - name: channel_key
         data_tests:

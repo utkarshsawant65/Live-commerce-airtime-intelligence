@@ -1,7 +1,4 @@
-{#
-    dim_show — conformed show dimension, SCD Type 1 (overwrite).
-    Includes the unknown member (-1) for orphan/late facts.
-#}
+{# Show dimension, SCD1 (overwrite), plus the unknown member (-1). #}
 
 with shows as (
     select

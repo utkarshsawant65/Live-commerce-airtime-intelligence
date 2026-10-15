@@ -1,6 +1,4 @@
-{#
-    Staging: returns. 1:1, typed, deduped on return_id. Links to an order line.
-#}
+{# Returns, deduped on return_id. One row per returned order line. #}
 
 with source as (
     select * from {{ source('raw', 'fact_returns') }}
@@ -11,7 +9,7 @@ deduped as (
         *,
         row_number() over (
             partition by return_id
-            order by loaded_at_utc desc
+            order by loaded_at_utc desc, return_ts_utc desc
         ) as _row_num
     from source
 )

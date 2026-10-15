@@ -1,0 +1,15 @@
+version: 2
+
+snapshots:
+  - name: dim_product_snapshot
+    description: >
+      SCD2 history of the current product row. Versions are effective from the snapshot
+      run that captured the change.
+    columns:
+      - name: product_id
+        description: Natural product key.
+        data_tests: [not_null]
+      - name: dbt_valid_from
+        description: Snapshot run time at which this version was captured.
+      - name: dbt_valid_to
+        description: Capture time of the next version; null for the current version.

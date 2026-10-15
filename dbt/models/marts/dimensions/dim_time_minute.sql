@@ -1,9 +1,6 @@
 {#
-    dim_time_minute — one row per minute of the day (1440 rows)
-
-    A time-of-day dimension (NOT a per-timestamp dimension) so facts can join on the
-    minute-of-day to ask "how does performance vary across the broadcast day / in prime
-    time?" The prime-time flag matches the generator's PRIME_TIME_HOURS (18:00–22:59).
+    One row per minute of the day (1440 rows), for slicing by time of day.
+    Prime time is 18:00-22:59, matching PRIME_TIME_HOURS in the generator.
 #}
 
 with minutes as (

@@ -1,26 +1,8 @@
 {#
-    mart_kpi_metrics — the single governed KPI surface.
-
-    THE "one definition, everywhere" mechanism. Every core monetary/volume KPI is
-    defined ONCE here, so Power BI (and any other consumer) reads a single, tested,
-    documented definition rather than re-deriving logic in DAX. This is what guarantees
-    two reports can never disagree on "revenue".
-
-    GRAIN: one row per (event_date, product_key, presenter_key, channel_key,
-    attributed_segment_id). The most granular conformed grain that still lets every KPI
-    in KPI_CATALOG.md roll up to any dimension by a simple SUM.
-
-    Base (additive) measures materialised here — see KPI_CATALOG.md for full definitions:
-      * gmv                        = Σ gross_amount
-      * discounts                  = Σ discount_amount
-      * returns_refund             = Σ refund_amount (aligned to the sale)
-      * net_revenue_after_returns  = gmv − discounts − returns_refund
-      * units_sold                 = Σ quantity
-      * returned_units             = Σ returned_qty
-      * distinct_orders            = COUNT(DISTINCT order_id)
-      * airtime_attributed_revenue = Σ net_amount of airtime-attributed lines only
-    Ratios (AOV, return rate, attributed share) are derived from these additive base
-    measures in the BI layer — never stored pre-divided at a grain that breaks roll-ups.
+    Additive KPI base measures (definitions in docs/KPI_CATALOG.md), so BI sums them instead
+    of re-deriving logic. Ratios such as AOV and return rate are computed in BI.
+    Grain: event_date x product_key x presenter_key x channel_key x attributed_segment_id.
+    Returns are aligned to the date and keys of the original sale.
 #}
 
 with order_lines as (
@@ -39,8 +21,7 @@ with order_lines as (
     from {{ ref('fact_order_line') }}
 ),
 
--- The presenter behind an order = the presenter of its attributed segment.
--- Organic orders (segment -1) get the unknown presenter key.
+-- An order's presenter is its attributed segment's presenter; organic orders get -1.
 segment_presenter as (
     select
         segment_id,
@@ -49,10 +30,10 @@ segment_presenter as (
 ),
 
 unknown_presenter as (
-    select presenter_key from {{ ref('dim_presenter') }} where presenter_id = -1
+    select presenter_key from {{ ref('dim_presenter') }}
+    where presenter_id = -1
 ),
 
--- Returns rolled to the order line, so they align to the sale's conformed keys.
 returns_per_line as (
     select
         order_line_id,
@@ -89,7 +70,6 @@ select
     presenter_key,
     channel_key,
     attributed_segment_id,
-    -- Additive base measures (one definition each).
     sum(gross_amount) as gmv,
     sum(discount_amount) as discounts,
     sum(returns_refund) as returns_refund,

@@ -1,7 +1,4 @@
-{#
-    Staging: presenters. 1:1, cleaned/typed/deduped on presenter_id.
-    SCD1 (overwrite) — keep only the latest loaded row per presenter.
-#}
+{# Presenters, deduped on presenter_id (SCD1: latest load wins). #}
 
 with source as (
     select * from {{ source('raw', 'dim_presenter') }}

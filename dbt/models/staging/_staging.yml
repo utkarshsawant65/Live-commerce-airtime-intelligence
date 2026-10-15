@@ -2,7 +2,7 @@ version: 2
 
 models:
   - name: stg_products
-    description: "Cleaned product versions (all history kept for the SCD2 snapshot)."
+    description: "Product versions as emitted by the source; the snapshot reads the current row."
     columns:
       - name: product_id
         description: Natural product key (stable across versions).
@@ -53,7 +53,7 @@ models:
         data_tests: [not_null]
 
   - name: stg_channels
-    description: "Channels from the governed seed."
+    description: "Channels from seed_channel."
     columns:
       - name: channel_id
         data_tests: [not_null, unique]
@@ -65,14 +65,13 @@ models:
                 values: [broadcast, online, phone]
 
   - name: stg_airtime_segments
-    description: "Broadcast segments — one product featured in one continuous on-air window."
+    description: "Broadcast segments: one product on air in one continuous window."
     columns:
       - name: segment_id
         data_tests: [not_null, unique]
       - name: product_id
         data_tests:
           - not_null
-          # Segments feature current products; orphan check against product natural keys.
           - relationships:
               arguments:
                 to: ref('stg_products')
@@ -97,7 +96,7 @@ models:
                 to: ref('stg_channels')
                 field: channel_id
       - name: segment_duration_minutes
-        description: Must be positive — a segment with non-positive duration is a load error.
+        description: Positive segment length in minutes.
         data_tests:
           - not_null
           - dbt_utils.accepted_range:
@@ -106,7 +105,7 @@ models:
                 inclusive: true
 
   - name: stg_order_lines
-    description: "Order lines — one row per product line per order."
+    description: "Order lines: one row per product line per order."
     columns:
       - name: order_line_id
         data_tests: [not_null, unique]
@@ -126,6 +125,8 @@ models:
               arguments:
                 to: ref('stg_channels')
                 field: channel_id
+      - name: event_ts_utc
+        data_tests: [not_null]
       - name: quantity
         data_tests:
           - not_null
@@ -143,12 +144,12 @@ models:
                 inclusive: true
 
   - name: stg_returns
-    description: "Returns — one row per returned order line."
+    description: "Returns: one row per returned order line."
     columns:
       - name: return_id
         data_tests: [not_null, unique]
       - name: order_line_id
-        description: Every return must point at a real order line (no orphan returns).
+        description: Order line being returned.
         data_tests:
           - not_null
           - relationships:
@@ -169,7 +170,7 @@ models:
                 values: [size_fit, not_as_described, changed_mind, damaged, late_delivery]
 
   - name: stg_traffic
-    description: "Minute-level traffic — the conversion denominator."
+    description: "Minute-level traffic per channel."
     columns:
       - name: channel_id
         data_tests:
@@ -194,10 +195,14 @@ models:
 
   - name: stg_order_lines_variant
     description: >
-      Defensively-parsed VARIANT order-line feed (schema-on-read). Each row is flagged
-      valid / invalid; invalid rows carry a dq_failure_reason and route to quarantine.
-      try_cast means a bad source value yields NULL + a flag, never a failed load.
+      Order lines parsed from the VARIANT feed with try_cast; each row is flagged valid or
+      invalid with a reason.
     columns:
+      - name: order_line_id
+        data_tests:
+          - unique:
+              config:
+                where: "is_valid"
       - name: is_valid
         description: True when the row passed all DQ checks.
         data_tests: [not_null]
@@ -205,10 +210,7 @@ models:
         description: Null for valid rows; the failing check for invalid rows.
 
   - name: stg_order_lines_quarantine
-    description: >
-      Rows from the VARIANT feed that failed validation — captured, not dropped. A row
-      here means a real source-data problem to inspect/backfill. This is the proof the
-      pipeline handles dirty data: bad rows are isolated and observable.
+    description: "Rows from the VARIANT feed that failed validation, kept for inspection."
     columns:
       - name: dq_failure_reason
         description: Why the row was quarantined.
@@ -223,3 +225,5 @@ models:
                   - non_positive_quantity
                   - missing_or_bad_event_ts
                   - bad_net_amount
+                  - unknown_product_id
+                  - duplicate_order_line

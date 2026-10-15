@@ -1,7 +1,4 @@
-{#
-    Staging: minute-level traffic. 1:1, typed, deduped on (channel_id, minute_ts_utc).
-    The conversion denominator — web_sessions feeds Conversion Rate.
-#}
+{# Minute-level traffic per channel, deduped on (channel_id, minute_ts_utc). #}
 
 with source as (
     select * from {{ source('raw', 'fact_traffic') }}

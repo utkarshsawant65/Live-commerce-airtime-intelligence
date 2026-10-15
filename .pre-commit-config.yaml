@@ -1,5 +1,6 @@
-# Local quality gate — the same checks CI enforces, run before each commit.
-# Install once with: pre-commit install
+# Install once with `pre-commit install`.
+# The sqlfluff hook uses the dbt templater, so it needs dbt/profiles.yml and the
+# Snowflake env vars from .env (see README).
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
@@ -13,10 +14,10 @@ repos:
       - id: check-merge-conflict
 
   - repo: https://github.com/sqlfluff/sqlfluff
-    rev: 3.2.5
+    rev: 4.4.0
     hooks:
       - id: sqlfluff-lint
-        # Lint dbt SQL through the dbt templater so ref()/source() resolve.
+        files: ^dbt/(models|snapshots|tests)/.*\.sql$
         additional_dependencies:
-          - dbt-snowflake>=1.7
-          - sqlfluff-templater-dbt>=3.0
+          - dbt-snowflake>=1.10,<2.0
+          - sqlfluff-templater-dbt>=4.0,<5

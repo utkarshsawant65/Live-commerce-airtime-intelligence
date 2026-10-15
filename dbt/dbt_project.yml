@@ -1,9 +1,9 @@
 name: 'live_commerce'
 version: '1.0.0'
 config-version: 2
+# 1.10+: generic tests use the `arguments:` syntax; snapshots use `schema` and `hard_deletes`.
+require-dbt-version: ">=1.10.0"
 
-# This profile is defined in profiles.yml (see profiles.example.yml). It points at
-# the WH_TRANSFORM warehouse via ROLE_TRANSFORMER.
 profile: 'live_commerce'
 
 model-paths: ["models"]
@@ -18,16 +18,14 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-# Surrogate-key salt for our own surrogate_key macro (kept stable across runs).
 vars:
-  # Attribution lag window (minutes) — MUST match the generator's LAG_MINUTES.
+  # Minutes after a segment ends during which orders still attribute to it.
+  # Must match LAG_MINUTES in the generator.
   attribution_lag_minutes: 30
-  # Incremental lookback (minutes) for fact_order_line — re-attributes late-arriving
-  # orders within this window on each incremental run.
+  # fact_order_line re-processes rows this far behind its latest event_ts_utc.
   incremental_lookback_minutes: 120
 
-# Layer materializations + clean schema routing. Schemas are RAW/STAGING/INTERMEDIATE/
-# MARTS (no dbt_<layer> prefix) via the generate_schema_name macro override.
+# Schema names come from generate_schema_name (STAGING, MARTS, ... with no prefix).
 models:
   live_commerce:
     staging:
@@ -39,14 +37,11 @@ models:
     marts:
       +schema: marts
       +materialized: table
-      facts:
-        +materialized: table   # fact_order_line overrides to incremental in its own config
 
 seeds:
   live_commerce:
-    # Seeds are reference inputs consumed by staging, not BI-facing marts. Land them
-    # in the staging schema so marts.<name> stays reserved for conformed models and
-    # there is no name collision (e.g. dim_channel the seed vs dim_channel the model).
+    # Seeds are staging inputs, not BI-facing; keeping them out of MARTS also avoids
+    # a name clash with the dim_channel model.
     +schema: staging
     seed_channel:
       +column_types:
@@ -54,4 +49,4 @@ seeds:
 
 snapshots:
   live_commerce:
-    +target_schema: snapshots
+    +schema: snapshots

@@ -1,14 +1,6 @@
 {#
-    mart_segment_performance — the hero mart for live-commerce analytics.
-
-    GRAIN: one row per airtime segment. Joins each broadcast segment to the revenue it
-    drove (orders attributed to it) and its duration, yielding the headline KPIs:
-      * revenue_per_broadcast_minute = attributed net revenue ÷ segment_duration_minutes
-      * attributed_revenue           = Σ net_amount of orders attributed to the segment
-      * attributed_orders            = COUNT(DISTINCT order_id) attributed to the segment
-
-    This is what makes the project unmistakably about live commerce: which product ×
-    presenter × time window earns the most per minute of air.
+    One row per airtime segment with the orders, units and net revenue attributed to it,
+    and revenue per broadcast minute.
 #}
 
 with segments as (
@@ -51,8 +43,7 @@ select
     coalesce(a.attributed_orders, 0) as attributed_orders,
     coalesce(a.attributed_units, 0) as attributed_units,
     coalesce(a.attributed_revenue, 0) as attributed_revenue,
-    -- Hero KPI. nullif guards a zero-duration segment (a singular test forbids those,
-    -- but defend the division anyway).
+    -- segment_duration_minutes >= 1 is tested; nullif only guards the division.
     coalesce(a.attributed_revenue, 0) / nullif(s.segment_duration_minutes, 0)
         as revenue_per_broadcast_minute
 from segments as s

@@ -1,22 +1,7 @@
 """
-Load generated CSVs into Snowflake RAW: PUT to internal stage, then COPY INTO.
-
-Implements the ingestion design from :
-    generator -> files -> PUT (internal stage stg_landing) -> COPY INTO RAW.<table>
-
-RAW tables are created here (typed, with a loaded_at_utc audit column). The
-generator output is the contract; dbt staging cleans/dedupes from RAW onward.
-
-Credentials come from environment variables (never committed). Copy .env.example
-to .env and fill it in, or export them in your shell:
-
-    SNOWFLAKE_ACCOUNT   e.g. ab12345.eu-central-1
-    SNOWFLAKE_USER
-    SNOWFLAKE_PASSWORD  (or set SNOWFLAKE_PRIVATE_KEY_PATH for key-pair auth)
-    SNOWFLAKE_ROLE       default ROLE_LOADER
-    SNOWFLAKE_WAREHOUSE  default WH_LOAD
-    SNOWFLAKE_DATABASE   default LIVE_COMMERCE
-    SNOWFLAKE_SCHEMA     default RAW
+Load a generated batch into Snowflake RAW: PUT each file to the internal stage
+raw.stg_landing, then COPY INTO the matching RAW table. Credentials come from the
+environment or a .env file (see .env.example).
 
 Usage:
     python generator/load_to_snowflake.py --in generator/output
@@ -32,7 +17,7 @@ import sys
 try:
     import snowflake.connector  # type: ignore
 except ImportError:
-    snowflake = None  # tolerated until the dependency is installed
+    snowflake = None
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -41,9 +26,7 @@ except ImportError:
     pass
 
 
-# RAW table DDL. Timestamps land as TIMESTAMP_NTZ (already UTC from the generator);
-# the generator's contract guarantees the values are UTC, so NTZ keeps it explicit
-# that no zone conversion happens before the BI layer (UTC everywhere).
+# Timestamps are already UTC from the generator, so they land as TIMESTAMP_NTZ.
 RAW_TABLES: dict[str, str] = {
     "dim_product": """
         product_id int, product_version int, product_name string, category string,
@@ -68,8 +51,7 @@ RAW_TABLES: dict[str, str] = {
 
 
 def _column_names(ddl: str) -> list[str]:
-    """Extract column names from a DDL string, splitting only on TOP-LEVEL commas so
-    that types like number(12,2) (which contain a comma) are not split mid-type."""
+    """Column names from a DDL string, splitting only on top-level commas (number(12,2) has one)."""
     cols, depth, current = [], 0, ""
     for ch in ddl:
         if ch == "(":
@@ -85,27 +67,48 @@ def _column_names(ddl: str) -> list[str]:
             current += ch
     if current.strip():
         cols.append(current)
-    # First whitespace-delimited token of each definition is the column name.
     return [c.strip().split()[0] for c in cols if c.strip()]
 
 
-def connect():
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"Missing environment variable {name} (see .env.example)")
+    return value
+
+
+def connect(role: str | None = None, warehouse: str | None = None, schema: str | None = None):
+    """Open a connection using password or key-pair auth; arguments override the env defaults."""
     if snowflake is None:
         sys.exit("snowflake-connector-python is not installed. Run: pip install -r requirements.txt")
     params = dict(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        role=os.environ.get("SNOWFLAKE_ROLE", "ROLE_LOADER"),
-        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "WH_LOAD"),
+        account=_require_env("SNOWFLAKE_ACCOUNT"),
+        user=_require_env("SNOWFLAKE_USER"),
+        role=role or os.environ.get("SNOWFLAKE_ROLE", "ROLE_LOADER"),
+        warehouse=warehouse or os.environ.get("SNOWFLAKE_WAREHOUSE", "WH_LOAD"),
         database=os.environ.get("SNOWFLAKE_DATABASE", "LIVE_COMMERCE"),
-        schema=os.environ.get("SNOWFLAKE_SCHEMA", "RAW"),
+        schema=schema or os.environ.get("SNOWFLAKE_SCHEMA", "RAW"),
     )
     key_path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
     if key_path:
         params["private_key_file"] = key_path
+        passphrase = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+        if passphrase:
+            params["private_key_file_pwd"] = passphrase
     else:
-        params["password"] = os.environ["SNOWFLAKE_PASSWORD"]
+        params["password"] = _require_env("SNOWFLAKE_PASSWORD")
     return snowflake.connector.connect(**params)
+
+
+def _rows_loaded(cur) -> int:
+    # COPY returns one row per file (file, status, rows_parsed, rows_loaded, ...), or a
+    # single status column when every file was already loaded and skipped.
+    return sum(r[3] for r in cur.fetchall() if len(r) > 3)
+
+
+def _put(cur, path: str, stage_dir: str) -> None:
+    posix_path = os.path.abspath(path).replace("\\", "/")
+    cur.execute(f"put 'file://{posix_path}' {stage_dir}/ overwrite=true auto_compress=true")
 
 
 def load(in_dir: str, truncate: bool, on_error: str = "abort_statement") -> None:
@@ -126,24 +129,14 @@ def load(in_dir: str, truncate: bool, on_error: str = "abort_statement") -> None
             if truncate:
                 cur.execute(f"truncate table raw.{table}")
 
-            # PUT overwrites the staged file; auto_compress gzips it on upload.
-            posix_path = csv_path.replace("\\", "/")
-            cur.execute(
-                f"put 'file://{posix_path}' {stage}/{table}/ overwrite=true auto_compress=true"
-            )
-            # COPY INTO with the named CSV format; explicit column list keeps it
-            # resilient to the audit column ordering. on_error is configurable:
-            #   abort_statement  -> fail fast (strict typed feeds)
-            #   continue         -> load good rows, skip bad (resilient feeds)
+            _put(cur, csv_path, f"{stage}/{table}")
             cols = _column_names(ddl)
             cur.execute(
                 f"copy into raw.{table} ({', '.join(cols)}) "
                 f"from {stage}/{table}/ file_format = raw.ff_csv "
                 f"pattern = '.*{table}.*\\.csv\\.gz' on_error = '{on_error}'"
             )
-            rows = cur.fetchall()
-            loaded = sum(r[2] for r in rows) if rows else 0
-            print(f"  loaded raw.{table}: {loaded} rows")
+            print(f"  loaded raw.{table}: {_rows_loaded(cur)} rows")
 
         load_variant_order_lines(cur, in_dir, stage, truncate)
         conn.commit()
@@ -153,13 +146,7 @@ def load(in_dir: str, truncate: bool, on_error: str = "abort_statement") -> None
 
 
 def load_variant_order_lines(cur, in_dir: str, stage: str, truncate: bool) -> None:
-    """Land the JSON order-line feed as VARIANT (schema-on-read).
-
-    Why: a typed CSV table breaks the load the moment a source adds/removes/renames a
-    field or sends a bad type. Landing the raw payload as a single VARIANT column means
-    the load NEVER breaks on a schema change — we parse (and validate/quarantine) in
-    staging instead. This is the resilient-ingestion pattern for semi-structured feeds.
-    """
+    """Land the JSON order-line feed as one VARIANT per row; parsing and quarantine happen in dbt."""
     json_path = os.path.join(in_dir, "fact_order_line.json")
     if not os.path.exists(json_path):
         print("  skip order_line_raw (VARIANT): no fact_order_line.json")
@@ -175,24 +162,19 @@ def load_variant_order_lines(cur, in_dir: str, stage: str, truncate: bool) -> No
     if truncate:
         cur.execute("truncate table raw.order_line_raw")
 
-    posix_path = json_path.replace("\\", "/")
-    cur.execute(
-        f"put 'file://{posix_path}' {stage}/order_line_raw/ overwrite=true auto_compress=true"
-    )
-    # strip_outer_array (ff_json) turns the JSON array into one VARIANT row per element.
+    _put(cur, json_path, f"{stage}/order_line_raw")
+    # ff_json uses strip_outer_array, so each array element becomes its own row.
     cur.execute(
         f"copy into raw.order_line_raw (payload, source_file) "
         f"from (select $1, metadata$filename from {stage}/order_line_raw/) "
         f"file_format = raw.ff_json "
         f"pattern = '.*fact_order_line.*\\.json\\.gz' on_error = 'continue'"
     )
-    rows = cur.fetchall()
-    loaded = sum(r[2] for r in rows) if rows else 0
-    print(f"  loaded raw.order_line_raw (VARIANT): {loaded} rows")
+    print(f"  loaded raw.order_line_raw (VARIANT): {_rows_loaded(cur)} rows")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="PUT + COPY INTO generated CSVs to Snowflake RAW.")
+    ap = argparse.ArgumentParser(description="PUT + COPY INTO generated files to Snowflake RAW.")
     ap.add_argument("--in", dest="in_dir", default="generator/output")
     ap.add_argument("--truncate", action="store_true",
                     help="truncate RAW tables before loading (full reload, not append)")

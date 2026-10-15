@@ -1,8 +1,6 @@
-# Normalize line endings to LF in the repo (text files), so CI on Linux and dev on
-# Windows agree. Checkouts on Windows still get CRLF for editors that want it.
+# Store text files with LF so Windows and Linux (CI) agree.
 * text=auto eol=lf
 
-# CSV seeds and data: LF, treated as text.
 *.csv text eol=lf
 *.sql text eol=lf
 *.py text eol=lf
@@ -10,7 +8,6 @@
 *.yaml text eol=lf
 *.md text eol=lf
 
-# Binary: never normalize.
 *.pbix binary
 *.png binary
 *.jpg binary

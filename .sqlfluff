@@ -1,9 +1,8 @@
 [sqlfluff]
-# Snowflake dialect; templated through dbt so ref()/source()/macros resolve.
 dialect = snowflake
 templater = dbt
-# Models, snapshots, singular tests, and the analysis SQL.
-exclude_rules = RF04, ST06, AM04
+# ST05: the small unknown-member lookups read better as inline subqueries.
+exclude_rules = RF04, ST05, ST06, AM04
 max_line_length = 120
 
 [sqlfluff:indentation]
@@ -18,7 +17,6 @@ profiles_dir = dbt
 spacing_before = touch
 line_position = trailing
 
-# Keywords lowercase, identifiers as written — house style for this repo.
 [sqlfluff:rules:capitalisation.keywords]
 capitalisation_policy = lower
 

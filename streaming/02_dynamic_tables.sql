@@ -1,31 +1,25 @@
 /* ============================================================================
-   Production-readiness showcase (2 of 2): Dynamic Tables
-   The declarative alternative to Streams + Tasks.
+   Dynamic table: the declarative alternative to Streams + Tasks. Snowflake keeps
+   marts.dt_order_line within TARGET_LAG of raw.fact_order_line, refreshing
+   incrementally where it can. Prefer Streams + Tasks when the logic needs multiple
+   statements or explicit control of the MERGE.
 
-   A DYNAMIC TABLE is defined by a SELECT plus a TARGET_LAG. Snowflake keeps it
-   refreshed within that lag, incrementally, automatically — no stream to manage, no
-   task to schedule, no MERGE to hand-write. You declare the result and the freshness
-   you want; the platform figures out the incremental maintenance.
-
-   When to prefer this over Streams + Tasks:
-     * You want declarative freshness (TARGET_LAG) instead of imperative scheduling.
-     * The transform is expressible as a single SELECT (most modelling is).
-   When to prefer Streams + Tasks:
-     * You need procedural/multi-statement logic, calls, or fine control of the MERGE.
-
-   Run as ROLE_TRANSFORMER.
+   Prerequisites: role_transformer needs SELECT on the source (granted in
+   00_setup.sql) and CREATE DYNAMIC TABLE on MARTS (included in ALL on the schema).
+   Change tracking must be on for the source table, enabled by its owner:
+     use role role_loader;
+     alter table live_commerce.raw.fact_order_line set change_tracking = true;
    ============================================================================ */
 
 use role role_transformer;
 use database live_commerce;
 use warehouse wh_transform;
 
--- A near-real-time attributed-order table, declared once. Snowflake maintains it
--- within ~1 minute of the upstream raw.fact_order_line changing — incrementally.
+-- A dynamic table starts refreshing as soon as it is created.
 create dynamic table if not exists marts.dt_order_line
     target_lag = '1 minute'
     warehouse = wh_transform
-    comment = 'Declarative near-real-time order lines; maintained incrementally by Snowflake.'
+    comment = 'Order lines kept within one minute of raw.fact_order_line.'
 as
     select
         order_line_id,
@@ -37,11 +31,14 @@ as
         net_amount
     from raw.fact_order_line;
 
--- Freshness/lag and refresh history:
+-- Suspended straight away so it does not consume credits until resumed.
+alter dynamic table marts.dt_order_line suspend;
+
+-- Resume / suspend:
+-- alter dynamic table marts.dt_order_line resume;
+-- alter dynamic table marts.dt_order_line suspend;
+
+-- Lag and refresh history:
 -- show dynamic tables like 'DT_ORDER_LINE' in schema marts;
 -- select * from table(information_schema.dynamic_table_refresh_history(
 --     name => 'LIVE_COMMERCE.MARTS.DT_ORDER_LINE')) order by data_timestamp desc;
-
--- Suspend/resume to control cost:
--- alter dynamic table marts.dt_order_line suspend;
--- alter dynamic table marts.dt_order_line resume;

@@ -1,21 +1,15 @@
 # Data generation
-numpy>=1.26
-pandas>=2.1
+numpy>=1.26,<3
 
-# Snowflake load (PUT + COPY INTO) — used by generator/load_to_snowflake.py
-snowflake-connector-python>=3.7
+# Snowflake load (PUT + COPY INTO) and the --from-snowflake z-test
+snowflake-connector-python>=3.7,<5
 
-# dbt (transform layer) — installs dbt-core as a dependency.
-# Floor is 1.8: the YAML schema uses the nested `arguments:`/`config:` syntax for
-# generic tests and source freshness (the modern, non-deprecated form).
-dbt-snowflake>=1.8
+# dbt; 1.10+ is needed for the `arguments:` generic-test syntax in the YAML
+dbt-snowflake>=1.10,<2.0
 
-# Linting / quality gate (also runs in CI)
-sqlfluff>=3.0
-sqlfluff-templater-dbt>=3.0
+# SQL linting (also runs in CI)
+sqlfluff>=3.0,<5
+sqlfluff-templater-dbt>=3.0,<5
 
-# Statistics (the one z-test) — scipy gives a clean, defensible implementation
-scipy>=1.11
-
-# Local secret management for the loader
-python-dotenv>=1.0
+# Reads .env for local credentials
+python-dotenv>=1.0,<2

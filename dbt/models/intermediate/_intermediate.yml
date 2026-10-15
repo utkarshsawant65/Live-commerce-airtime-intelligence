@@ -3,14 +3,13 @@ version: 2
 models:
   - name: int_orders_attributed_to_airtime
     description: >
-      Attribution layer. One row per order line, tagged with the airtime segment that
-      drove it (or -1 = organic/baseline). Applies the lag window and the last-touch
-      overlap rule. Ephemeral — glue between staging and fact_order_line, not BI-facing.
+      One row per order line with the airtime segment it is attributed to (-1 = organic).
+      Ephemeral; feeds fact_order_line.
     columns:
       - name: order_line_id
         data_tests: [not_null, unique]
       - name: attributed_segment_id
-        description: Segment that drove the order, or -1 for organic/baseline.
+        description: Attributed segment, or -1 for organic.
         data_tests: [not_null]
       - name: is_airtime_attributed
         data_tests: [not_null]

@@ -1,10 +1,4 @@
-{#
-    Staging: products. 1:1 with raw, cleaned/typed/deduped.
-
-    Raw carries one row per product per version. We keep ALL versions here (the SCD2
-    snapshot in Phase 3 needs the history); we only dedupe exact duplicate rows that a
-    re-load could introduce, keyed on the natural (product_id, product_version) grain.
-#}
+{# Product versions as emitted by the source, deduped on (product_id, product_version). #}
 
 with source as (
     select * from {{ source('raw', 'dim_product') }}

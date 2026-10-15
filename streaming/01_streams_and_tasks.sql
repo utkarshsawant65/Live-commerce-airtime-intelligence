@@ -1,34 +1,25 @@
 /* ============================================================================
-   Production-readiness showcase (1 of 2): Streams + Tasks
-   Snowflake-native continuous incremental processing.
+   Streams + Tasks: continuous incremental processing of raw.fact_order_line.
+   A stream records rows added since it was last consumed; a task merges that
+   delta into marts.rt_order_line every minute, only when the stream has data.
 
-   This module is NOT used by the demo (the demo runs on micro-batch COPY INTO +
-   dbt incremental, which is correct for an analytical warehouse). It exists to show
-   the production upgrade path: if the business needed near-real-time freshness, this
-   is how we would do it ON SNOWFLAKE — no second system (no Kafka), no extra ops.
-
-   How it works:
-     * A STREAM on raw.fact_order_line records the change set (new rows) since it was
-       last consumed — change-data-capture, built into the table.
-     * A scheduled TASK wakes on a cadence (or on a stream-has-data condition), reads
-       only the stream's delta, and MERGEs it into a curated table. Each run touches
-       only what changed, so cost scales with the delta, not the table.
-
-   Run as ROLE_TRANSFORMER (needs CREATE STREAM / CREATE TASK on the schemas).
+   Prerequisites (run once as ACCOUNTADMIN):
+     grant create stream, create task on schema live_commerce.raw to role role_transformer;
+     grant execute task on account to role role_transformer;
+   Change tracking must be on for the source table, and only its owner (role_loader)
+   can enable it:
+     use role role_loader;
+     alter table live_commerce.raw.fact_order_line set change_tracking = true;
    ============================================================================ */
 
 use role role_transformer;
 use database live_commerce;
 use warehouse wh_transform;
 
--- ----------------------------------------------------------------------------
--- 1. A stream = built-in change capture over the raw order-line landing table.
--- ----------------------------------------------------------------------------
 create stream if not exists raw.strm_order_line
     on table raw.fact_order_line
-    comment = 'CDC stream: new/changed order-line rows since last consumption.';
+    comment = 'Order-line rows added or changed since last consumption.';
 
--- Curated near-real-time target the task maintains incrementally.
 create table if not exists marts.rt_order_line (
     order_line_id integer,
     order_id integer,
@@ -40,11 +31,7 @@ create table if not exists marts.rt_order_line (
     merged_at_utc timestamp_ntz
 );
 
--- ----------------------------------------------------------------------------
--- 2. A task that consumes the stream delta and MERGEs it — only when there is data.
---    SCHEDULE could be '1 minute' for near-real-time; we gate on the stream so an
---    idle feed costs nothing (the task no-ops when system$stream_has_data is false).
--- ----------------------------------------------------------------------------
+-- The WHEN clause skips the run (no warehouse time) when the stream is empty.
 create task if not exists raw.task_merge_order_line
     warehouse = wh_transform
     schedule = '1 minute'
@@ -61,7 +48,7 @@ as
             quantity,
             net_amount
         from raw.strm_order_line
-        -- Consume only true row inserts/updates from the CDC stream.
+        -- Updates appear as a DELETE + INSERT pair; the INSERT carries the new values.
         where metadata$action = 'INSERT'
     ) as src
     on tgt.order_line_id = src.order_line_id
@@ -81,10 +68,10 @@ as
         src.event_ts_utc, src.quantity, src.net_amount, sysdate()
     );
 
--- Tasks are created SUSPENDED. Resume to start the schedule; suspend to stop billing.
+-- Tasks are created suspended. Resume to start the schedule; suspend to stop it.
 -- alter task raw.task_merge_order_line resume;
 -- alter task raw.task_merge_order_line suspend;
 
--- Inspect recent task runs:
+-- Recent task runs:
 -- select * from table(information_schema.task_history(
 --     task_name => 'TASK_MERGE_ORDER_LINE')) order by scheduled_time desc;

@@ -1,6 +1,4 @@
-{#
-    Staging: shows. 1:1, cleaned/typed/deduped on show_id. SCD1.
-#}
+{# Shows, deduped on show_id (SCD1: latest load wins). #}
 
 with source as (
     select * from {{ source('raw', 'dim_show') }}
