@@ -142,6 +142,12 @@ python generator/generate_batch.py --out generator/output --days 5 --seed 42
 python analysis/conversion_lift_test.py --in generator/output
 ```
 
+On the 90-day dashboard dataset (`--days 90 --seed 42`) the same test gives 96,471 /
+2,667,643 vs 23,762 / 1,452,136 (identical from Snowflake and offline): measured +121.0%
+(95% CI +117.9% to +124.1%), planted +117.8%, just below the interval (about 2 standard
+errors). Five other 90-day seeds land between -1.7 and +0.8 standard errors of their
+planted value (mean -0.2), so this is chance rather than bias.
+
 These numbers measure planted parameters; they are not findings about a real business.
 
 ## Dashboard
@@ -248,12 +254,21 @@ so products and presenters stay identical to the initial load.
 
 ## Status
 
-An earlier version of the pipeline was built and run end to end on Snowflake in June 2026:
-generator, load, dbt build and tests, CI, and the four-page Power BI report. The current
-version (session-driven generator, event-time SCD2, attribution unit test, validation
-harness) is verified offline: `dbt parse` (24 models, 190 data tests, 1 unit test,
-1 snapshot, 2 seeds per `dbt ls`), 22 pytest tests and the validation harness. It has not
-yet been re-run on Snowflake. Known limitations and next steps are at the end of
+The current code was run end to end on a Snowflake trial account on 25 October 2026:
+
+- 90-day dataset (`--days 90 --seed 42`: 181,356 orders, 227,748 lines, 2,900 segments)
+  loaded with key-pair auth; `dbt build --full-refresh` passed all 218 nodes (24 models,
+  190 data tests, 1 unit test, 1 snapshot, 2 seeds); `sqlfluff lint` clean.
+- The z-test read from `mart_conversion_windows` gives exactly the same counts as the
+  offline rules on the same batch.
+- A `--dirty` batch: quarantine counts per reason equal the manifest (91 of each type).
+- Incremental runs: two appended live batches, no duplicate `order_line_id`, and a row
+  loaded late with an event time months in the past was picked up.
+- The snapshot captured an in-place product change as a new version with a gap-free timeline.
+- A green CI `build-and-test` run against the same account.
+
+Lineage and catalog: [dbt docs](https://utkarshsawant65.github.io/Live-commerce-airtime-intelligence/). Offline, the same code passes 22 pytest tests and
+the validation harness. Known limitations and next steps are at the end of
 [DECISIONS.md](DECISIONS.md).
 
 ## License

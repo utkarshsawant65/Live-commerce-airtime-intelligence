@@ -24,6 +24,16 @@ Freshness is report-only because the batch covers a fixed past window.
 and the badge reflects `parse` only: dbt parse, pytest and the offline smoke test. The
 Snowflake build, data tests, unit test and lint run only when the secrets are configured.
 
+**Secrets and the shared RAW schema.** A green `build-and-test` run against a Snowflake
+trial account was recorded on 25 October 2026. Every run truncates and reloads RAW with a
+2-day batch, so with the secrets in place, any PR replaces whatever dataset RAW holds (for
+example the 90-day dashboard dataset). Remove the secrets once the run you need is done, or
+point CI at its own database or account. Without them the job is skipped, not failed.
+
+**Use a service user for CI.** Key-pair login builds a token from the account and user
+name, so a user name with a dot in it fails with "JWT token is invalid". Create a dedicated
+user with `type = service` and the key, and grant it `ROLE_LOADER` and `ROLE_TRANSFORMER`.
+
 ## 1. Snowflake user and roles
 
 The CI job loads RAW (as `ROLE_LOADER` on `WH_LOAD`) and runs dbt (as `ROLE_TRANSFORMER` on
