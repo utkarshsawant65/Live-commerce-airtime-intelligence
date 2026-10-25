@@ -1,6 +1,8 @@
 {#
-    One row per airtime segment with the orders, units and net revenue attributed to it,
-    and revenue per broadcast minute.
+    One row per airtime segment with the orders, units and net revenue attributed to it.
+    Attributed revenue covers the whole attribution window (airtime + the lag tail), so:
+      revenue_per_broadcast_minute = attributed revenue / on-air minutes
+      revenue_per_window_minute    = attributed revenue / (on-air minutes + lag minutes)
 #}
 
 with segments as (
@@ -45,6 +47,9 @@ select
     coalesce(a.attributed_revenue, 0) as attributed_revenue,
     -- segment_duration_minutes >= 1 is tested; nullif only guards the division.
     coalesce(a.attributed_revenue, 0) / nullif(s.segment_duration_minutes, 0)
-        as revenue_per_broadcast_minute
+        as revenue_per_broadcast_minute,
+    coalesce(a.attributed_revenue, 0)
+    / (s.segment_duration_minutes + {{ var('attribution_lag_minutes') }})
+        as revenue_per_window_minute
 from segments as s
 left join attributed_orders as a on s.segment_id = a.attributed_segment_id

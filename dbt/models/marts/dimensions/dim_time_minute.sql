@@ -1,6 +1,6 @@
 {#
     One row per minute of the day (1440 rows), for slicing by time of day.
-    Prime time is 18:00-22:59, matching PRIME_TIME_HOURS in the generator.
+    Daypart and prime time come from macros/daypart.sql.
 #}
 
 with minutes as (
@@ -16,14 +16,6 @@ select
     hour(date_minute) as hour_of_day,
     minute(date_minute) as minute_of_hour,
     (hour(date_minute) * 60 + minute(date_minute)) as minute_of_day,
-    case
-        when hour(date_minute) between 18 and 22 then true
-        else false
-    end as is_prime_time,
-    case
-        when hour(date_minute) between 5 and 11 then 'morning'
-        when hour(date_minute) between 12 and 17 then 'afternoon'
-        when hour(date_minute) between 18 and 22 then 'prime_time'
-        else 'late_night'
-    end as daypart
+    {{ is_prime_time('hour(date_minute)') }} as is_prime_time,
+    {{ daypart('hour(date_minute)') }} as daypart
 from minutes

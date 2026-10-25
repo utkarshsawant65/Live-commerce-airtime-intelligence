@@ -1,6 +1,7 @@
 /* ============================================================================
-   SCD2 walkthrough: change a tracked product attribute and watch the snapshot
-   close the old version and open a new one.
+   Snapshot walkthrough: change a tracked product attribute in place and watch the
+   capture-time audit trail (dim_product_snapshot) close the old version and open a
+   new one. dim_product itself is dated by the source's valid_from / valid_to.
 
    Prerequisite: `dbt build` has run at least once, so dim_product_snapshot exists.
 

@@ -59,12 +59,7 @@ orders_by_grain as (
         ms.airtime_state,
         cast(o.minute_ts_utc as date) as event_date,
         o.channel_key,
-        case
-            when hour(o.minute_ts_utc) between 5 and 11 then 'morning'
-            when hour(o.minute_ts_utc) between 12 and 17 then 'afternoon'
-            when hour(o.minute_ts_utc) between 18 and 22 then 'prime_time'
-            else 'late_night'
-        end as daypart,
+        {{ daypart('hour(o.minute_ts_utc)') }} as daypart,
         count(distinct o.order_id) as orders
     from order_minutes as o
     inner join minute_state as ms on o.minute_ts_utc = ms.minute_ts_utc
@@ -76,12 +71,7 @@ sessions_by_grain as (
         ms.airtime_state,
         cast(t.minute_ts_utc as date) as event_date,
         t.channel_key,
-        case
-            when hour(t.minute_ts_utc) between 5 and 11 then 'morning'
-            when hour(t.minute_ts_utc) between 12 and 17 then 'afternoon'
-            when hour(t.minute_ts_utc) between 18 and 22 then 'prime_time'
-            else 'late_night'
-        end as daypart,
+        {{ daypart('hour(t.minute_ts_utc)') }} as daypart,
         sum(t.web_sessions) as web_sessions
     from traffic_minutes as t
     inner join minute_state as ms on t.minute_ts_utc = ms.minute_ts_utc

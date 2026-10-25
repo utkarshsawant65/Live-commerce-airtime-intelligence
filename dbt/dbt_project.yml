@@ -33,7 +33,8 @@ models:
       +materialized: view
     intermediate:
       +schema: intermediate
-      +materialized: ephemeral
+      # A view rather than ephemeral so the attribution model can be unit tested.
+      +materialized: view
     marts:
       +schema: marts
       +materialized: table

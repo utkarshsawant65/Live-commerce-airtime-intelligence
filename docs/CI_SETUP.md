@@ -6,7 +6,7 @@ time) because they share the RAW schema.
 
 | Job | When | What it does |
 |---|---|---|
-| `parse` | always | `dbt deps` + `dbt parse` offline with placeholder credentials; generates a 2-day batch and runs the z-test as a smoke test |
+| `parse` | always | `dbt deps` + `dbt parse` offline with placeholder credentials; `python -m pytest -q`; smoke test: generates a 2-day batch, runs the z-test and `validate_against_truth.py` on it |
 | `check-secrets` | always | reports whether `SNOWFLAKE_ACCOUNT` is set (secrets cannot be read in a job-level `if`) |
 | `build-and-test` | only if the secret exists | key-pair login, `dbt debug`, loads a 2-day batch into RAW with `--truncate`, runs `drop_ci_schemas` then `dbt build --target ci --full-refresh`, `sqlfluff lint` (blocking, dbt templater), `dbt source freshness` (report only) |
 
@@ -19,6 +19,10 @@ also develop locally against the same database, a CI run replaces your RAW data.
 separate Snowflake database or account for CI in that case.
 
 Freshness is report-only because the batch covers a fixed past window.
+
+**What a green badge means.** Without the Snowflake secrets, `build-and-test` is skipped
+and the badge reflects `parse` only: dbt parse, pytest and the offline smoke test. The
+Snowflake build, data tests, unit test and lint run only when the secrets are configured.
 
 ## 1. Snowflake user and roles
 
@@ -69,8 +73,9 @@ and decodes it to a file at runtime, then checks it with `openssl pkey`.
 ## 4. Branch protection
 
 Settings → Branches → add a rule for `main`: require a pull request and require the `parse`
-and `build-and-test` checks to pass. When the secrets are missing (for example on forks),
-`build-and-test` is skipped rather than failed.
+check to pass. Add `build-and-test` as a required check only once the secrets are
+configured. When the secrets are missing (for example on forks), `build-and-test` is
+skipped rather than failed.
 
 ## Local development
 

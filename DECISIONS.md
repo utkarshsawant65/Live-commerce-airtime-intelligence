@@ -38,18 +38,22 @@ The main design choices, the alternative considered, and why. Each is rated:
 
 ## Dimensional modelling
 
-### D4. SCD2 only on product (Strong)
-- **Chosen:** a dbt snapshot (`check` strategy on category, price band, list price, brand and
-  name) over the current product row. A new version is effective from the snapshot run that
-  captured the change, i.e. processing time. `dim_product` opens each product's first version
-  at 1900-01-01 so events before the first snapshot still resolve. Presenter and show are SCD1.
-- **Rejected:** historising every dimension.
-- **Why:** category and price band are the attributes that change and that sales are analysed
-  by. Presenter and show attributes do not change meaningfully here, so history would be cost
-  without use.
-- **Trade-off:** versions follow snapshot time, not a source effective date. A change is
-  attributed correctly only if snapshots run soon after it lands.
-  [`snowflake/demo_scd2.sql`](snowflake/demo_scd2.sql) shows a change being captured.
+### D4. SCD2 only on product, dated by event time (Strong)
+- **Chosen:** `dim_product` has one row per source version (`product_id` + `product_version`),
+  valid over `[valid_from, valid_to)` as dated by the source. Facts join to the version valid
+  at their event time, and the singular test
+  `assert_order_lines_use_version_valid_at_event_time` checks that every order line does.
+  The `dim_product_snapshot` snapshot (`check` strategy) is kept as a capture-time audit trail
+  of what the warehouse saw and when. Presenter and show are SCD1.
+- **Rejected:** building `dim_product` from the snapshot, and historising every dimension.
+- **Why:** a snapshot dates a change by the run that captured it, so a price change that
+  lands late would be applied to orders from after the capture, not from when it took effect.
+  The source's own validity dates are the effective dates. Category and price are the
+  attributes that change and that sales are analysed by; presenter and show attributes do not
+  change meaningfully here, so history would be cost without use.
+- **Trade-off:** this relies on the source providing correct validity dates. The snapshot
+  remains as an independent record if they turn out wrong.
+  [`snowflake/demo_scd2.sql`](snowflake/demo_scd2.sql) walks through the snapshot.
 
 ### D5. Transaction price on the fact (Strong)
 - **Chosen:** `unit_price_paid` and the money measures live on `fact_order_line`.
@@ -78,12 +82,17 @@ The main design choices, the alternative considered, and why. Each is rated:
 ### D8. Last-touch attribution within a lag window (Medium)
 - **Chosen:** an order line goes to the segment for the same product whose window
   `[start, end + attribution_lag_minutes)` contains the order time; ties go to the latest start.
-  No match means organic (`-1`).
+  No match means organic (`-1`). The model is a view so that a dbt unit test
+  (`attribution_window_boundaries_and_tie_break`, seven hand-made cases) can check the
+  boundaries and the tie-break.
 - **Rejected:** first-touch, or fractional multi-touch.
 - **Why:** the most recent airing is the most plausible single cause, and the rule is simple
   to explain and test.
-- **Trade-off:** when a product airs repeatedly, multi-touch could be more accurate. The lag
-  is a dbt var (30 min) that must match `LAG_MINUTES` in the generator and the z-test.
+- **Trade-off:** the window length trades precision for recall. Against the generator's
+  ground truth, 30 minutes gives 96.3% precision and 87.7% recall on the sample batch; 60
+  minutes gives 94.9% / 94.5% (see [docs/VALIDATION.md](docs/VALIDATION.md)). When a product
+  airs repeatedly, multi-touch could be more accurate. The lag is a dbt var (30 min) that
+  must match `LAG_MINUTES` in the generator and in `analysis/offline_rules.py`.
 
 ### D9. Population-level conversion lift (Medium)
 - **Chosen:** conversion = distinct online orders ÷ online web sessions, split by whether the
@@ -113,8 +122,8 @@ The main design choices, the alternative considered, and why. Each is rated:
   or incremental refresh, or a composite model with DirectQuery on the hot facts.
 
 ### D12. One BI tool (Strong)
-- **Why:** Power BI, Tableau and Looker do the same job here. One report with a clean star
-  model and RLS is more useful than the same charts in two tools.
+- **Why:** Power BI, Tableau and Looker do the same job here. One report on a clean star
+  model is more useful than the same charts in two tools.
 
 ---
 
@@ -122,11 +131,13 @@ The main design choices, the alternative considered, and why. Each is rated:
 
 ### D13. One test: a two-proportion z-test (Strong)
 - **Chosen:** a one-sided z-test of on-air vs off-air conversion, using only the standard
-  library (`math.erfc`).
+  library, with 95% CIs for the absolute and relative lift. `--bootstrap-days` adds a
+  day-level bootstrap CI.
 - **Rejected:** several tests, or a forecasting model.
 - **Why:** the data is two groups of trials summarised as counts and denominators, which is
   the standard setting for comparing two proportions. Assumptions: sessions are treated as
   independent trials, and the result is population-level, not a per-user causal estimate.
+  The day-level bootstrap relaxes the independence assumption.
 
 ---
 
@@ -138,26 +149,65 @@ The main design choices, the alternative considered, and why. Each is rated:
 
 ### D15. Functional roles and unprefixed schema names (Strong)
 - **Why:** `role_loader`, `role_transformer` and `role_bi_reader` each get only what their job
-  needs (BI reads `MARTS` only); Power BI RLS restricts rows again in the report. Schema names
-  are the same in every environment, so grants and connections don't change. CI adds a `_CI`
-  suffix via `DBT_SCHEMA_SUFFIX`.
+  needs (BI reads `MARTS` only). Schema names are the same in every environment, so grants
+  and connections don't change. CI adds a `_CI` suffix via `DBT_SCHEMA_SUFFIX`.
 
-### D16. Synthetic data (Medium)
-- **Chosen:** generate data with a known airtime effect.
-- **Why:** no public dataset has an airtime dimension, and a known effect means the
-  attribution and lift test can be checked.
-- **Trade-off:** synthetic data is cleaner than real feeds. `--dirty` corrupts the JSON
-  order-line feed (duplicates, null product ids, non-numeric quantities, orphan product ids,
-  late timestamps) and writes a manifest of what it injected, to exercise the VARIANT path.
+---
+
+## Synthetic data
+
+### D16. Synthetic data with planted parameters (Medium)
+- **Chosen:** generate data from named parameters (base conversion, on-air uplift, tier and
+  prime-time weights, price factor, return rates, response lag), record them in the batch
+  manifest, and write the true segment of every order line to
+  `_truth_order_attribution.csv`. The truth file is never loaded into Snowflake (the loader
+  refuses `_truth_*` files), so the pipeline measures blind.
+  `analysis/validate_against_truth.py` checks parameter recovery, attribution precision and
+  recall, a null test (`--onair-uplift 0`) and CI coverage over 50 seeds.
+- **Rejected:** a public dataset (none has an airtime dimension), or synthetic data checked
+  only by eye.
+- **Why:** with known inputs, every measured number has a target, and a wrong rule shows up
+  as a recovery failure rather than a plausible-looking chart.
+- **Trade-off:** synthetic data is cleaner than real feeds, and recovering parameters that
+  the same author planted shows the pipeline is internally consistent, not that the model of
+  viewer behaviour is right. `--dirty` corrupts the JSON order-line feed (duplicates, null
+  product ids, non-numeric quantities, orphan product ids, late timestamps) and records what
+  it injected, to exercise the VARIANT path.
+
+### D17. Orders driven by sessions × conversion (Strong)
+- **Chosen:** online orders are generated from sessions. Every online minute converts at
+  `BASE_CONVERSION` (1.5%); each segment adds incremental orders at
+  `BASE_CONVERSION × ONAIR_UPLIFT × segment weight` per session during its airing, timed by a
+  lognormal response lag. The traffic halo raises on-air session volume only.
+- **Rejected:** the earlier generator, which drew orders and traffic separately and produced
+  the lift through the traffic halo.
+- **Why:** in the earlier version orders ÷ sessions had no modelled meaning: the measured lift
+  was set by the halo (+449% at halo 1.0, +10% at 5.0) rather than by any conversion
+  parameter. Now the conversion rate is a planted parameter the pipeline must recover, and
+  the halo check shows the measured lift follows the planted value across halo settings.
+- **Trade-off:** the expected lift still depends slightly on the halo, because airtime orders
+  arriving after the 30-minute window count in the off-air baseline. The manifest computes
+  this expected value per batch, so the comparison stays exact.
 
 ---
 
 ## Known limitations / next steps
 
+- The current code has been verified offline only (`dbt parse`, pytest, the validation
+  harness). An earlier version ran end to end on Snowflake; the current one has not yet been
+  re-run there.
+- The Power BI report was built on the earlier generator and needs a refresh from a
+  documented dataset (`--days 90 --seed 42`). The `.pbix` is not in the repo.
+- Row-level security in the Power BI report is planned; it cannot be verified from the repo
+  because the `.pbix` is not included. The access control in the repo is Snowflake RBAC
+  (`snowflake/00_setup.sql`).
+- Tier and prime-time recovery CIs are wide on 5 days of data (star / established 0.86 to
+  1.56); longer batches narrow them.
+- The measured lift depends slightly on the halo through late airtime orders (D17).
+- Attribution recall is below 100% at 30 minutes by design: the planted lag has a long tail.
 - The VARIANT feed is a parallel landing path: the facts are built from the typed CSV feed,
   so dirty-mode rows are visible in `stg_order_lines_variant` and the quarantine but do not
   reach `fact_order_line`.
-- SCD2 versions use snapshot (processing) time rather than a source effective date.
 - CI truncates and reloads the unsuffixed RAW schema; it should use its own database or account.
 - Per-product conversion lift would need a session-to-product model.
 - Multi-touch attribution as an alternative to last-touch, if repeated airings dominate.

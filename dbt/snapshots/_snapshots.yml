@@ -3,8 +3,8 @@ version: 2
 snapshots:
   - name: dim_product_snapshot
     description: >
-      SCD2 history of the current product row. Versions are effective from the snapshot
-      run that captured the change.
+      Capture-time audit trail of the current product row: records when each change was
+      first seen by a snapshot run. dim_product uses the source's own validity dates.
     columns:
       - name: product_id
         description: Natural product key.
