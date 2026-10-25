@@ -386,9 +386,9 @@ are a check on the pipeline, not business findings.
 - Airtime-attributed revenue, airtime share and broadcast minutes.
 - Revenue by presenter, coloured by tier. Tier multipliers are planted at 1.6 (star),
   1.25 (established) and 1.05 (rookie). Revenue per broadcast minute comes out star €307,
-  established €249, rookie €239. The gaps are smaller than the multipliers because the
-  baseline-free share of segment revenue also depends on price and time slot; the clean
-  recovery of the ratios is in `docs/VALIDATION.md`.
+  established €249, rookie €239. Revenue per minute also depends on product prices and on
+  which time slots each presenter happened to host, so the gaps are not the pure multipliers;
+  the ratios themselves are recovered in `docs/VALIDATION.md`.
 - Revenue per broadcast minute by daypart: prime time €378 vs €145-161 elsewhere, the
   planted 1.6× prime weight combined with 2.1× prime-time traffic.
 - Category × presenter heatmap. Each show draws from fixed categories and each airing has
