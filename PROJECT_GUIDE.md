@@ -410,13 +410,14 @@ are a check on the pipeline, not business findings.
 
 ## 14. Status
 
-- An earlier version was built and run end to end on Snowflake in June 2026: setup, load
-  (typed and VARIANT), dbt build with the snapshot, attribution, facts, dimensions and marts,
-  CI, and the four-page Power BI report.
-- The current version is verified offline: `dbt parse` (24 models, 190 data tests, 1 unit
-  test, 1 snapshot, 2 seeds), 22 pytest tests and the validation harness. It has not yet been
-  re-run on Snowflake.
-- `dbt docs generate` lineage includes the dashboard exposure; view it with `dbt docs serve`.
+- Run end to end on a Snowflake trial account on 25 October 2026 with the current code:
+  90-day dataset loaded, `dbt build --full-refresh` passing all 218 nodes, sqlfluff clean,
+  and a green CI `build-and-test` run.
+- Checked on Snowflake: mart z-test counts identical to the offline rules; dirty-batch
+  quarantine counts equal the manifest; incremental runs pick up late-loaded rows without
+  duplicates; the snapshot captures an in-place change.
+- Offline: 22 pytest tests and the validation harness (`docs/VALIDATION.md`).
+- Lineage and catalog, including the dashboard exposure: [dbt docs](https://utkarshsawant65.github.io/Live-commerce-airtime-intelligence/).
 
 Limitations and next steps: end of [DECISIONS.md](DECISIONS.md).
 

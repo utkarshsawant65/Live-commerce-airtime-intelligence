@@ -193,9 +193,8 @@ The main design choices, the alternative considered, and why. Each is rated:
 
 ## Known limitations / next steps
 
-- The current code has been verified offline only (`dbt parse`, pytest, the validation
-  harness). An earlier version ran end to end on Snowflake; the current one has not yet been
-  re-run there.
+- Snowflake verification comes from a trial account (October 2026). CI runs the Snowflake
+  build only while the secrets are configured, and each run reloads the shared RAW schema.
 - The Power BI report was built on the earlier generator and needs a refresh from a
   documented dataset (`--days 90 --seed 42`). The `.pbix` is not in the repo.
 - Row-level security in the Power BI report is planned; it cannot be verified from the repo
