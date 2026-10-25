@@ -15,14 +15,14 @@
     )
 }}
 
-select
-    product_id,
-    product_name,
-    category,
-    brand,
-    list_price,
-    list_price_band
-from {{ ref('stg_products') }}
-where is_current = true
+    select
+        product_id,
+        product_name,
+        category,
+        brand,
+        list_price,
+        list_price_band
+    from {{ ref('stg_products') }}
+    where is_current = true
 
 {% endsnapshot %}

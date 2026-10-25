@@ -23,22 +23,39 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DBT_DIR = os.path.join(os.path.dirname(HERE), "dbt")
 
 
+def _parse(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def _previous_batch(out_dir: str) -> dict | None:
+    manifest = os.path.join(out_dir, "_batch_manifest.json")
+    if not os.path.exists(manifest):
+        return None
+    with open(manifest, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _next_window_start(out_dir: str, default_start: datetime) -> tuple[datetime, int, int]:
     """Return (window start, order id offset, segment id offset) following the last batch."""
-    manifest = os.path.join(out_dir, "_batch_manifest.json")
-    if os.path.exists(manifest):
-        with open(manifest, encoding="utf-8") as f:
-            m = json.load(f)
-        last_start = datetime.strptime(m["window_start_utc"], "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc)
-        return (last_start + timedelta(days=m["days"]),
+    m = _previous_batch(out_dir)
+    if m:
+        return (_parse(m["window_start_utc"]) + timedelta(days=m["days"]),
                 int(m["max_order_id"]),
                 int(m.get("max_segment_id", 0)))
     return default_start, 0, 0
 
 
+def _dbt_executable() -> str:
+    """dbt from the same environment as this Python, falling back to PATH."""
+    bin_dir = os.path.dirname(sys.executable)
+    for name in ("dbt.exe", "dbt"):
+        if os.path.exists(os.path.join(bin_dir, name)):
+            return os.path.join(bin_dir, name)
+    return "dbt"
+
+
 def _run_dbt() -> int:
-    cmd = ["dbt", "build"]
+    cmd = [_dbt_executable(), "build"]
     if not os.environ.get("DBT_PROFILES_DIR"):
         cmd += ["--profiles-dir", DBT_DIR]
     return subprocess.call(cmd, cwd=DBT_DIR)
@@ -59,6 +76,12 @@ def main() -> None:
     args = ap.parse_args()
 
     default_start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    # Continue with the dimensions of the batch already in --out, if there is one, so
+    # appended batches describe the same products, versions and presenters.
+    prev = _previous_batch(args.out)
+    dim_seed = int(prev["dim_seed"]) if prev and "dim_seed" in prev else args.seed
+    dim_start = _parse(prev["dim_start_utc"]) if prev and "dim_start_utc" in prev else default_start
+    dim_days = int(prev["dim_days"]) if prev and "dim_days" in prev else args.iterations * args.batch_days
 
     for i in range(args.iterations):
         start, order_seq, segment_seq = _next_window_start(args.out, default_start)
@@ -70,8 +93,7 @@ def main() -> None:
         summary = gb.generate(args.out, start, args.batch_days, seed,
                               n_products=args.products, n_presenters=args.presenters,
                               order_seq_start=order_seq, segment_seq_start=segment_seq,
-                              dim_seed=args.seed, dim_start=default_start,
-                              dim_days=args.iterations * args.batch_days)
+                              dim_seed=dim_seed, dim_start=dim_start, dim_days=dim_days)
         print(f"  generated {summary['counts']['order_lines']} order lines")
 
         if not args.no_load:

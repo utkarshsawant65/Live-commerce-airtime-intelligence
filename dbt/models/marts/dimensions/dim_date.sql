@@ -5,13 +5,25 @@
 #}
 
 with source_ranges as (
-    select min(event_ts_utc) as min_ts, max(event_ts_utc) as max_ts from {{ ref('stg_order_lines') }}
+    select
+        min(event_ts_utc) as min_ts,
+        max(event_ts_utc) as max_ts
+    from {{ ref('stg_order_lines') }}
     union all
-    select min(return_ts_utc), max(return_ts_utc) from {{ ref('stg_returns') }}
+    select
+        min(return_ts_utc) as min_ts,
+        max(return_ts_utc) as max_ts
+    from {{ ref('stg_returns') }}
     union all
-    select min(start_ts_utc), max(end_ts_utc) from {{ ref('stg_airtime_segments') }}
+    select
+        min(start_ts_utc) as min_ts,
+        max(end_ts_utc) as max_ts
+    from {{ ref('stg_airtime_segments') }}
     union all
-    select min(minute_ts_utc), max(minute_ts_utc) from {{ ref('stg_traffic') }}
+    select
+        min(minute_ts_utc) as min_ts,
+        max(minute_ts_utc) as max_ts
+    from {{ ref('stg_traffic') }}
 ),
 
 bounds as (
@@ -47,5 +59,5 @@ select
     day(date_day) as day_of_month,
     dayofweek(date_day) as day_of_week,
     dayname(date_day) as day_name,
-    case when dayofweek(date_day) in (0, 6) then true else false end as is_weekend
+    dayofweek(date_day) in (0, 6) as is_weekend
 from clipped
