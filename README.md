@@ -142,11 +142,11 @@ python generator/generate_batch.py --out generator/output --days 5 --seed 42
 python analysis/conversion_lift_test.py --in generator/output
 ```
 
-On the 90-day dashboard dataset (`--days 90 --seed 42`) the same test gives 96,471 /
-2,667,643 vs 23,762 / 1,452,136 (identical from Snowflake and offline): measured +121.0%
-(95% CI +117.9% to +124.1%), planted +117.8%, just below the interval (about 2 standard
-errors). Five other 90-day seeds land between -1.7 and +0.8 standard errors of their
-planted value (mean -0.2), so this is chance rather than bias.
+On the dashboard dataset (June to August, `--start 2026-06-01 --days 92 --seed 42`) the same test gives 96,069 /
+2,677,192 vs 24,590 / 1,500,582, identical from Snowflake and offline: measured +119.0%
+(95% CI +116.0% to +122.0%), planted +115.6%, just below the interval (about 2.2 standard
+errors). Ten other 92-day seeds all contain their planted lift (z between -1.8 and +1.4,
+mean -0.3), so this is chance rather than bias.
 
 These numbers measure planted parameters; they are not findings about a real business.
 
@@ -155,16 +155,17 @@ These numbers measure planted parameters; they are not findings about a real bus
 Four Power BI pages built on the marts. On generated data they show the planted parameters
 coming back through the pipeline:
 
-| Page | Content | What it should show on generated data |
+| Page | Content | Planted vs shown (dashboard dataset) |
 |---|---|---|
-| Overview | Net revenue after returns, GMV, revenue per broadcast minute, channel mix | a channel mix close to the expected shares (about 41% web, 26% app, 25% call centre, 8% TV on the sample batch) |
-| Airtime | Revenue by presenter and tier, revenue per minute by daypart, category × presenter | star above established above rookie (tier multipliers planted at 1.6 / 1.25 / 1.05) and a prime-time premium (planted 1.6) |
-| Conversion | On-air vs off-air conversion, by daypart, with the z-test result | the measured lift next to the planted lift |
-| Returns | Return rate by category, reason and price band; refunded value | category rates near the planted Fashion 28%, Jewellery 24%, Beauty 10%, Home & Living 8%, Wellness 7%, Electronics 6% (×1.2 for premium and luxury) |
+| Overview | Net revenue after returns €19.06M, GMV €23.82M, €257 per broadcast minute, channel mix | order share planted 40.4 / 25.8 / 25.8 / 8.1% (web / app / call centre / TV), measured 40.5 / 25.8 / 25.9 / 7.9% |
+| Airtime | Revenue by presenter and tier, revenue per minute by daypart, category × presenter | tier multipliers planted 1.6 / 1.25 / 1.05: revenue per minute star €307, established €249, rookie €239. Prime time €378 vs €145-161 per minute: the planted 1.6× prime weight on top of 2.1× prime-time traffic |
+| Conversion | On-air vs off-air online conversion, by daypart | planted lift +115.6%, measured +119.0% (3.59% vs 1.64%) |
+| Returns | Return rate by category, reason and price band; refunded value | reasons planted 40 / 25 / 20 / 10 / 5%, shown 40.0 / 24.9 / 19.9 / 10.1 / 5.1%. Category rates (by units) follow the planted order: Fashion 26.3%, Jewellery 23.1% … Electronics 5.5% |
 
-The `.pbix` is not in the repo. The report was built on an earlier version of the generator
-and will be refreshed from a documented dataset (`--days 90 --seed 42`). The
-[project guide](PROJECT_GUIDE.md#13-dashboard) describes each page.
+The dataset is `python generator/generate_batch.py --out generator/output --start 2026-06-01 --days 92 --seed 42`. Unit-based
+return rates sit a little below the planted line-level rates because partial returns are
+allowed; the line-level check is in [docs/VALIDATION.md](docs/VALIDATION.md). The `.pbix`
+is not in the repo; the [project guide](PROJECT_GUIDE.md#13-dashboard) describes each page.
 
 ## Repository layout
 
@@ -256,7 +257,7 @@ so products and presenters stay identical to the initial load.
 
 The current code was run end to end on a Snowflake trial account on 25 October 2026:
 
-- 90-day dataset (`--days 90 --seed 42`: 181,356 orders, 227,748 lines, 2,900 segments)
+- Dashboard dataset (`--start 2026-06-01 --days 92 --seed 42`: 182,203 orders, 228,886 lines, 2,912 segments)
   loaded with key-pair auth; `dbt build --full-refresh` passed all 218 nodes (24 models,
   190 data tests, 1 unit test, 1 snapshot, 2 seeds); `sqlfluff lint` clean.
 - The z-test read from `mart_conversion_windows` gives exactly the same counts as the
