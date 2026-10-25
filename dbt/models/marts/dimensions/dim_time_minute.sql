@@ -16,10 +16,7 @@ select
     hour(date_minute) as hour_of_day,
     minute(date_minute) as minute_of_hour,
     (hour(date_minute) * 60 + minute(date_minute)) as minute_of_day,
-    case
-        when hour(date_minute) between 18 and 22 then true
-        else false
-    end as is_prime_time,
+    hour(date_minute) between 18 and 22 as is_prime_time,
     case
         when hour(date_minute) between 5 and 11 then 'morning'
         when hour(date_minute) between 12 and 17 then 'afternoon'
