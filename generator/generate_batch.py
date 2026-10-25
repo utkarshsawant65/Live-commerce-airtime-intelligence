@@ -1,12 +1,15 @@
 """
-Generate one batch of synthetic live-commerce data with an airtime -> sales effect built in.
+Generate one batch of synthetic live-commerce data with known, planted parameters.
 
-Writes dimension and fact CSVs (UTC timestamps), a JSON copy of the order lines for the
-VARIANT feed, and _batch_manifest.json to --out. A fixed seed makes runs reproducible.
+Online orders are driven by sessions: a baseline conversion everywhere, plus incremental
+orders for the product on air. Every planted parameter goes into _batch_manifest.json
+("planted"), and the true segment behind each order line goes into
+_truth_order_attribution.csv, which is never loaded into Snowflake. The pipeline measures
+the parameters without seeing either; analysis/validate_against_truth.py compares them.
 
 Usage:
     python generator/generate_batch.py --out generator/output
-    python generator/generate_batch.py --out generator/output --start 2026-06-10 --days 3 --seed 7
+    python generator/generate_batch.py --out generator/output --days 5 --seed 42 --onair-uplift 0
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import argparse
 import copy
 import csv
 import json
+import math
 import os
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -28,6 +32,7 @@ CHANNELS = [
     (3, "Mobile App", "online"),
     (4, "Call Centre", "phone"),
 ]
+TV_CHANNEL_ID = 1
 
 CATEGORIES = [
     # name, base_return_rate
@@ -38,32 +43,72 @@ CATEGORIES = [
     ("Electronics", 0.06),
     ("Wellness", 0.07),
 ]
+PREMIUM_RETURN_MULT = 1.2  # premium and luxury lines return more often
 
-SHOWS = [
-    # show_name, format
-    ("Morning Glow", "magazine"),
-    ("Prime Time Live", "flagship"),
-    ("Weekend Style Edit", "themed"),
-    ("Late Night Deals", "clearance"),
-    ("Jewellery Hour", "themed"),
-]
+RETURN_REASONS = ["size_fit", "not_as_described", "changed_mind", "damaged", "late_delivery"]
+RETURN_REASON_PROBS = [0.4, 0.2, 0.25, 0.1, 0.05]
 
 EXPERIENCE_TIERS = ["rookie", "established", "star"]
+TIER_SHARE = [0.3, 0.5, 0.2]
 
-# Expected airtime orders per segment minute, by presenter tier.
+# --- Conversion model (online channels) -------------------------------------------
+BASE_CONVERSION = 0.00015   # orders per web session, on or off air
+ONAIR_UPLIFT = 0.63         # incremental orders per exposed session, relative to baseline
+HALO = 2.9                  # online sessions multiplier while a segment window is open
+
+# Segment weight = tier x prime x price factor. Scales airtime orders only, never baseline.
 TIER_LIFT_MULTIPLIER = {"rookie": 1.05, "established": 1.25, "star": 1.6}
+PRIME_SEGMENT_MULT = 1.6
 
-# (mean, std) of concurrent viewers / sessions per minute, by channel type.
-BASELINE_TRAFFIC = {
-    "broadcast": (4000, 1200),
-    "online": (900, 250),
-    "phone": (120, 40),
-}
 
+def price_factor(list_price: float) -> float:
+    """Cheaper products convert better on air."""
+    return float(np.clip(2.0 - list_price / 400.0, 0.4, 1.8))
+
+
+# --- Phone and TV orders (outside the conversion metric) --------------------------
+PHONE_BASE_CONVERSION = 0.002          # orders per call-centre contact
+PHONE_ORDERS_PER_SEGMENT_MIN = 0.20    # x segment weight
+TV_CALLIN_ORDERS_PER_SEGMENT_MIN = 0.20
+
+# --- Traffic -----------------------------------------------------------------------
+# Mean sessions (online) / contacts (phone) / viewers (broadcast) per minute.
+BASELINE_TRAFFIC = {1: (4000, 1200), 2: (1100, 280), 3: (700, 180), 4: (120, 40)}
 PRIME_TIME_HOURS = set(range(18, 23))  # 18:00-22:59 UTC
-PRIME_TIME_TRAFFIC_MULT = 2.1
 
-LAG_MINUTES = 30  # must match dbt var attribution_lag_minutes
+
+def hour_traffic_mult(hour: int) -> float:
+    if hour < 7:
+        return 0.3
+    if hour in PRIME_TIME_HOURS:
+        return 2.1
+    if hour == 23:
+        return 0.8
+    return 1.0
+
+
+# --- Response lag: minutes from segment start to order, lognormal with a long tail ---
+LAG_MEDIAN_MIN = 9.0
+LAG_SIGMA = 1.25
+LAG_CAP_MIN = 360
+LAG_MINUTES = 30  # attribution window tail; must match dbt var attribution_lag_minutes
+
+# --- Baskets and product history -------------------------------------------------
+ADDON_ORDER_SHARE = 0.17   # orders that get 1-2 extra lines for other products
+PRE_WINDOW_CHANGE_SHARE = 0.25
+IN_WINDOW_CHANGE_SHARE = 0.10
+
+# --- Schedule: one TV channel, shows in fixed, non-overlapping slots ---------------
+# name, format, earliest start hour, latest end hour, categories (None = any), days
+SHOWS = [
+    ("Morning Glow", "magazine", 8, 11, ["Beauty", "Wellness", "Home & Living"], "all"),
+    ("Jewellery Hour", "themed", 13, 17, ["Jewellery"], "weekday"),
+    ("Weekend Style Edit", "themed", 13, 17, ["Fashion", "Beauty"], "weekend"),
+    ("Prime Time Live", "flagship", 18, 22, None, "all"),
+    ("Late Night Deals", "clearance", 22, 24, None, "all"),
+]
+SHOW_PROBABILITY = {"Morning Glow": 0.8, "Jewellery Hour": 0.85,
+                    "Weekend Style Edit": 0.9, "Prime Time Live": 1.0, "Late Night Deals": 0.7}
 
 
 @dataclass
@@ -121,9 +166,11 @@ def _product_name(rng: np.random.Generator, category: str, pid: int) -> str:
     return f"{adj} {noun}"
 
 
-def build_products(rng: np.random.Generator, n_products: int, window_start: datetime) -> list[Product]:
-    """Products; ~25% get an earlier SCD2 version that expired before the window."""
+def build_products(rng: np.random.Generator, n_products: int, window_start: datetime,
+                   days: int) -> list[Product]:
+    """Products with SCD2 history: some changed before the window, some change inside it."""
     brands = ["Auriva", "Lumino", "Casa Verde", "NordTech", "Belle Maison", "PureForm"]
+    first_seen = (window_start - timedelta(days=120)).date().isoformat()
     products: list[Product] = []
     for pid in range(1, n_products + 1):
         category = CATEGORIES[rng.integers(0, len(CATEGORIES))][0]
@@ -131,37 +178,30 @@ def build_products(rng: np.random.Generator, n_products: int, window_start: date
         # Log-normal prices; parameters chosen so every price band is well populated.
         price = float(round(np.exp(rng.normal(4.3, 1.0)), 2))
         price = min(max(price, 7.99), 1999.0)
-        band = _band_for_price(price)
         name = _product_name(rng, category, pid)
 
-        changed = rng.random() < 0.25
-        if changed:
-            old_valid_from = (window_start - timedelta(days=120)).date().isoformat()
-            change_date = (window_start - timedelta(days=30)).date().isoformat()
-            # Old version differs by category or by a lower price.
+        r = rng.random()
+        if r < PRE_WINDOW_CHANGE_SHARE:
+            # Earlier version differs by category or by a lower price; changed 30 days back.
+            change = (window_start - timedelta(days=30)).date().isoformat()
             if rng.random() < 0.5:
-                old_category = CATEGORIES[rng.integers(0, len(CATEGORIES))][0]
-                old_price = price
+                old_category, old_price = CATEGORIES[rng.integers(0, len(CATEGORIES))][0], price
             else:
-                old_category = category
-                old_price = float(round(price * rng.uniform(0.55, 0.8), 2))
-            products.append(Product(
-                product_id=pid, product_version=1, product_name=name,
-                category=old_category, brand=brand, list_price=old_price,
-                list_price_band=_band_for_price(old_price),
-                valid_from=old_valid_from, valid_to=change_date, is_current=False,
-            ))
-            products.append(Product(
-                product_id=pid, product_version=2, product_name=name,
-                category=category, brand=brand, list_price=price, list_price_band=band,
-                valid_from=change_date, valid_to="9999-12-31", is_current=True,
-            ))
+                old_category, old_price = category, float(round(price * rng.uniform(0.55, 0.8), 2))
+            versions = [(old_category, old_price), (category, price)]
+        elif r < PRE_WINDOW_CHANGE_SHARE + IN_WINDOW_CHANGE_SHARE and days >= 2:
+            # Price change on a day inside the window.
+            change = (window_start + timedelta(days=int(rng.integers(1, days)))).date().isoformat()
+            versions = [(category, price), (category, float(round(price * rng.uniform(0.7, 0.9), 2)))]
         else:
+            change, versions = None, [(category, price)]
+
+        bounds = [first_seen] + ([change] if change else []) + ["9999-12-31"]
+        for v, (cat, p) in enumerate(versions, start=1):
             products.append(Product(
-                product_id=pid, product_version=1, product_name=name,
-                category=category, brand=brand, list_price=price, list_price_band=band,
-                valid_from=(window_start - timedelta(days=120)).date().isoformat(),
-                valid_to="9999-12-31", is_current=True,
+                product_id=pid, product_version=v, product_name=name, category=cat,
+                brand=brand, list_price=p, list_price_band=_band_for_price(p),
+                valid_from=bounds[v - 1], valid_to=bounds[v], is_current=(v == len(versions)),
             ))
     return products
 
@@ -169,214 +209,253 @@ def build_products(rng: np.random.Generator, n_products: int, window_start: date
 def build_presenters(rng: np.random.Generator, n: int) -> list[dict]:
     first = ["Anja", "Markus", "Lena", "Tobias", "Sofia", "Jonas", "Clara", "Felix",
              "Nina", "David", "Mara", "Paul"]
-    presenters = []
-    for i in range(1, n + 1):
-        tier = rng.choice(EXPERIENCE_TIERS, p=[0.3, 0.5, 0.2])
-        presenters.append({
-            "presenter_id": i,
-            "presenter_name": f"{first[(i - 1) % len(first)]} P{i}",
-            "experience_tier": str(tier),
-        })
-    return presenters
+    # Fixed tier mix (shuffled) so every tier is present even with few presenters.
+    counts = [round(n * s) for s in TIER_SHARE]
+    counts[1] += n - sum(counts)
+    tiers = rng.permutation([t for t, c in zip(EXPERIENCE_TIERS, counts) for _ in range(c)])
+    return [{"presenter_id": i,
+             "presenter_name": f"{first[(i - 1) % len(first)]} P{i}",
+             "experience_tier": str(tiers[i - 1])}
+            for i in range(1, n + 1)]
 
 
 def build_shows() -> list[dict]:
-    return [{"show_id": i + 1, "show_name": n, "show_format": f}
-            for i, (n, f) in enumerate(SHOWS)]
+    return [{"show_id": i + 1, "show_name": s[0], "show_format": s[1]}
+            for i, s in enumerate(SHOWS)]
 
 
 # ---------------------------------------------------------------------------
-# Facts
+# Schedule and traffic
 # ---------------------------------------------------------------------------
 
-def build_airtime_segments(
-    rng: np.random.Generator,
-    products: list[Product],
-    presenters: list[dict],
-    shows: list[dict],
-    window_start: datetime,
-    days: int,
-    segment_seq_start: int = 0,
-) -> list[dict]:
-    """Broadcast schedule: 3-5 shows a day, each a run of back-to-back product segments on TV."""
-    current_products = [p for p in products if p.is_current]
+def build_airtime_segments(rng, products, presenters, shows, window_start, days,
+                           segment_seq_start=0) -> list[dict]:
+    """Daily TV schedule. Show slots never overlap; each show is a run of 5-14 min segments
+    for products from the show's categories, hosted by one presenter."""
+    current = [p for p in products if p.is_current]
+    by_category: dict[str, list[Product]] = {}
+    for p in current:
+        by_category.setdefault(p.category, []).append(p)
+
     segments: list[dict] = []
     seg_id = segment_seq_start
-    tv_channel_id = 1
-
     for d in range(days):
         day = window_start + timedelta(days=d)
-        n_shows = int(rng.integers(3, 6))
-        show_start_hours = sorted(rng.choice(
-            list(range(8, 23)), size=n_shows, replace=False,
-            p=_hour_weights(),
-        ))
-        for sh in show_start_hours:
-            show = shows[rng.integers(0, len(shows))]
+        weekend = day.weekday() >= 5
+        for show, (name, _fmt, first_hour, last_hour, cats, when) in zip(shows, SHOWS):
+            if (when == "weekday" and weekend) or (when == "weekend" and not weekend):
+                continue
+            if rng.random() > SHOW_PROBABILITY[name]:
+                continue
+            start_hour = int(rng.integers(first_hour, max(first_hour + 1, last_hour - 1)))
+            slot_end = day.replace(hour=0, minute=0, second=0) + timedelta(hours=last_hour)
+            cursor = day.replace(hour=start_hour, minute=0, second=0)
+            show_minutes = min(int(rng.integers(60, 121)), int((slot_end - cursor).total_seconds() // 60))
+            pool = [p for c in cats for p in by_category.get(c, [])] if cats else current
+            pool = pool or current
             presenter = presenters[rng.integers(0, len(presenters))]
-            cursor = day.replace(hour=int(sh), minute=0, second=0, microsecond=0)
-            # 60-120 minute show made of 5-14 minute segments.
-            show_minutes = int(rng.integers(60, 121))
             elapsed = 0
             while elapsed < show_minutes - 5:
-                dur = int(rng.integers(5, 15))
-                if elapsed + dur > show_minutes:
-                    dur = show_minutes - elapsed
-                product = current_products[rng.integers(0, len(current_products))]
+                dur = min(int(rng.integers(5, 15)), show_minutes - elapsed)
+                product = pool[rng.integers(0, len(pool))]
                 start = cursor + timedelta(minutes=elapsed)
-                end = start + timedelta(minutes=dur)
                 seg_id += 1
                 segments.append({
                     "segment_id": seg_id,
                     "product_id": product.product_id,
                     "presenter_id": presenter["presenter_id"],
                     "show_id": show["show_id"],
-                    "channel_id": tv_channel_id,
+                    "channel_id": TV_CHANNEL_ID,
                     "start_ts_utc": _iso(start),
-                    "end_ts_utc": _iso(end),
+                    "end_ts_utc": _iso(start + timedelta(minutes=dur)),
                     "segment_duration_minutes": dur,
                 })
                 elapsed += dur
+    assert_no_overlap(segments)
     return segments
 
 
-def _hour_weights() -> np.ndarray:
-    hours = list(range(8, 23))
-    w = np.array([1.0 if h not in PRIME_TIME_HOURS else 2.5 for h in hours])
-    return w / w.sum()
-
-
-def build_traffic(
-    rng: np.random.Generator,
-    segments: list[dict],
-    window_start: datetime,
-    days: int,
-) -> list[dict]:
-    """One row per channel per minute; online traffic gets a halo while any segment is on air."""
-    on_air_minutes: set[int] = set()
+def assert_no_overlap(segments: list[dict]) -> None:
+    """Segments on the same channel must not overlap in [start, end)."""
+    by_channel: dict[int, list[tuple[str, str]]] = {}
     for s in segments:
-        st = _parse(s["start_ts_utc"])
-        en = _parse(s["end_ts_utc"]) + timedelta(minutes=LAG_MINUTES)
-        m = st
-        while m < en:
-            on_air_minutes.add(int(m.timestamp()) // 60)
-            m += timedelta(minutes=1)
-
-    rows: list[dict] = []
-    total_minutes = days * 24 * 60
-    for ch_id, ch_name, ch_type in CHANNELS:
-        base_v, base_std = BASELINE_TRAFFIC[ch_type]
-        for i in range(total_minutes):
-            minute = window_start + timedelta(minutes=i)
-            prime = minute.hour in PRIME_TIME_HOURS
-            mult = PRIME_TIME_TRAFFIC_MULT if prime else 1.0
-            halo = 1.0
-            if ch_type == "online" and (int(minute.timestamp()) // 60) in on_air_minutes:
-                halo = 2.9
-            mean = base_v * mult * halo
-            viewers = max(0, int(rng.normal(mean, base_std)))
-            # Online: sessions == visitors. Phone: call volume. Broadcast: no sessions.
-            if ch_type == "online":
-                sessions = viewers
-            elif ch_type == "phone":
-                sessions = max(0, int(viewers))
-            else:
-                sessions = 0
-            rows.append({
-                "channel_id": ch_id,
-                "minute_ts_utc": _iso(minute),
-                "concurrent_viewers": viewers if ch_type == "broadcast" else 0,
-                "web_sessions": sessions,
-            })
-    return rows
+        by_channel.setdefault(s["channel_id"], []).append((s["start_ts_utc"], s["end_ts_utc"]))
+    for spans in by_channel.values():
+        spans.sort()
+        for (_, prev_end), (start, _) in zip(spans, spans[1:]):
+            if start < prev_end:
+                raise AssertionError(f"overlapping segments: {start} starts before {prev_end}")
 
 
-def build_orders_and_returns(
-    rng: np.random.Generator,
-    products: list[Product],
-    presenters: list[dict],
-    segments: list[dict],
-    window_start: datetime,
-    days: int,
-    order_seq_start: int,
-) -> tuple[list[dict], list[dict]]:
-    """Airtime-driven orders per segment plus a uniform off-air baseline. Returns (order_lines, returns)."""
+def on_air_mask(segments: list[dict], window_start: datetime, total_minutes: int) -> np.ndarray:
+    """True for window minutes inside any segment's [start, end + LAG_MINUTES)."""
+    mask = np.zeros(total_minutes, dtype=bool)
+    for s in segments:
+        a = _minute_index(s["start_ts_utc"], window_start)
+        b = _minute_index(s["end_ts_utc"], window_start) + LAG_MINUTES
+        mask[max(a, 0):min(b, total_minutes)] = True
+    return mask
+
+
+def build_traffic(rng, mask: np.ndarray, window_start: datetime, halo: float) -> dict[int, np.ndarray]:
+    """Per-minute traffic per channel: viewers (TV), sessions (online), contacts (phone)."""
+    n = len(mask)
+    hours = np.array([(window_start + timedelta(minutes=i)).hour for i in range(n)])
+    hour_mult = np.array([hour_traffic_mult(h) for h in range(24)])[hours]
+    traffic = {}
+    for ch_id, _name, ch_type in CHANNELS:
+        mean, std = BASELINE_TRAFFIC[ch_id]
+        mu = mean * hour_mult * (np.where(mask, halo, 1.0) if ch_type == "online" else 1.0)
+        traffic[ch_id] = np.maximum(0, rng.normal(mu, std * hour_mult)).astype(np.int64)
+    return traffic
+
+
+# ---------------------------------------------------------------------------
+# Orders and returns
+# ---------------------------------------------------------------------------
+
+def _lag_cdf(x: float) -> float:
+    if x <= 0:
+        return 0.0
+    return 0.5 * (1 + math.erf((math.log(x) - math.log(LAG_MEDIAN_MIN)) / (LAG_SIGMA * math.sqrt(2))))
+
+
+def _lag_minute_probs() -> np.ndarray:
+    """P(order lands j whole minutes after segment start), j = 0..LAG_CAP_MIN (cap absorbs the tail)."""
+    cdf = np.array([_lag_cdf(j) for j in range(LAG_CAP_MIN + 1)])
+    probs = np.diff(cdf, append=1.0)
+    return probs
+
+
+class _Ids:
+    def __init__(self, order_seq_start: int):
+        self.order = order_seq_start
+        self.line = order_seq_start * 4   # at most 3 lines per order
+        self.ret = order_seq_start * 2
+
+
+def build_orders_and_returns(rng, products, presenters, segments, traffic, window_start,
+                             order_seq_start, base_conversion, onair_uplift):
+    """Returns (order_lines, returns, truth, expected) where expected holds the planted
+    expectations the validation compares against."""
+    n_min = len(next(iter(traffic.values())))
+    window_end = window_start + timedelta(minutes=n_min)
     presenter_tier = {p["presenter_id"]: p["experience_tier"] for p in presenters}
-    cat_return_rate = dict(CATEGORIES)
-    current_by_id = {p.product_id: p for p in products if p.is_current}
-    online_channels = [c[0] for c in CHANNELS if c[2] in ("online", "phone")]
-    tv_channel_id = 1
+    versions: dict[int, list[Product]] = {}
+    for p in products:
+        versions.setdefault(p.product_id, []).append(p)
+    current = [v[-1] for v in versions.values()]
+    online = [c[0] for c in CHANNELS if c[2] == "online"]
+    phone = [c[0] for c in CHANNELS if c[2] == "phone"]
+    ids = _Ids(order_seq_start)
+    order_lines, returns, truth = [], [], []
+    exp_orders = {c[0]: 0.0 for c in CHANNELS}
 
-    order_lines: list[dict] = []
-    returns: list[dict] = []
-    order_id = order_seq_start
-    line_id = order_seq_start * 4
-    return_id = order_seq_start * 2
+    def version_at(pid: int, ts: datetime) -> Product:
+        day = ts.date().isoformat()
+        for v in versions[pid]:
+            if v.valid_from <= day < v.valid_to:
+                return v
+        return versions[pid][-1]
 
-    for seg in segments:
-        product = current_by_id.get(seg["product_id"])
-        if product is None:
-            continue
-        tier = presenter_tier[seg["presenter_id"]]
-        lift = TIER_LIFT_MULTIPLIER[tier]
-        st = _parse(seg["start_ts_utc"])
-        prime = st.hour in PRIME_TIME_HOURS
-        price_factor = np.clip(2.0 - (product.list_price / 400.0), 0.4, 1.8)
-        expected = (seg["segment_duration_minutes"] * lift
-                    * (1.6 if prime else 1.0) * price_factor * rng.uniform(0.8, 1.2))
-        n_orders = int(rng.poisson(max(expected, 0.1)))
-
-        for _ in range(n_orders):
-            # Front-loaded order time, capped one minute inside the half-open
-            # [start, end + lag) window so every airtime order attributes.
-            offset = min(
-                rng.exponential(seg["segment_duration_minutes"] * 0.6),
-                seg["segment_duration_minutes"] + LAG_MINUTES - 1,
-            )
-            ts = st + timedelta(minutes=float(offset))
-            channel_id = int(rng.choice(online_channels + [tv_channel_id],
-                                        p=_order_channel_probs(len(online_channels))))
-            order_id += 1
-            line_id += 1
-            ol = _make_order_line(rng, line_id, order_id, product, channel_id, ts)
+    def add_order(pid, channel_id, ts, source, segment_id):
+        ids.order += 1
+        lines = [pid]
+        if rng.random() < ADDON_ORDER_SHARE:
+            for _ in range(int(rng.integers(1, 3))):
+                lines.append(current[rng.integers(0, len(current))].product_id)
+        for k, line_pid in enumerate(lines):
+            ids.line += 1
+            product = version_at(line_pid, ts)
+            ol = _make_order_line(rng, ids.line, ids.order, product, channel_id, ts)
             order_lines.append(ol)
-            _maybe_return(rng, ol, product, cat_return_rate, returns, return_id_ref := [return_id])
-            return_id = return_id_ref[0]
+            truth.append({"order_line_id": ids.line,
+                          "true_segment_id": segment_id if k == 0 else -1,
+                          "order_source": source if k == 0 else "addon"})
+            _maybe_return(rng, ol, product, returns, ids)
 
-    # Organic orders spread uniformly over the window, independent of airtime.
-    n_organic = int(days * 24 * 60 * 0.13 * len(online_channels))
-    current_products = list(current_by_id.values())
-    for _ in range(n_organic):
-        minute_offset = int(rng.integers(0, days * 24 * 60))
-        ts = window_start + timedelta(minutes=minute_offset)
-        product = current_products[rng.integers(0, len(current_products))]
-        channel_id = int(rng.choice(online_channels))
-        order_id += 1
-        line_id += 1
-        ol = _make_order_line(rng, line_id, order_id, product, channel_id, ts)
-        order_lines.append(ol)
-        _maybe_return(rng, ol, product, cat_return_rate, returns, ref := [return_id])
-        return_id = ref[0]
+    def minute_ts(i: int) -> datetime:
+        return window_start + timedelta(minutes=int(i), seconds=int(rng.integers(0, 60)))
 
-    return order_lines, returns
+    # Baseline: every online and phone minute converts at the base rate, product at random.
+    for ch in online + phone:
+        rate = base_conversion if ch in online else PHONE_BASE_CONVERSION
+        lam = traffic[ch] * rate
+        exp_orders[ch] += float(lam.sum())
+        for i in np.nonzero(counts := rng.poisson(lam))[0]:
+            for _ in range(int(counts[i])):
+                add_order(current[rng.integers(0, len(current))].product_id, ch,
+                          minute_ts(i), "baseline", -1)
+
+    # Airtime: incremental orders per segment, timed by the response lag.
+    lag_probs = _lag_minute_probs()
+    for seg in segments:
+        st = _parse(seg["start_ts_utc"])
+        a = _minute_index(seg["start_ts_utc"], window_start)
+        b = a + seg["segment_duration_minutes"]
+        product = version_at(seg["product_id"], st)
+        weight = (TIER_LIFT_MULTIPLIER[presenter_tier[seg["presenter_id"]]]
+                  * (PRIME_SEGMENT_MULT if st.hour in PRIME_TIME_HOURS else 1.0)
+                  * price_factor(product.list_price))
+        lam = {ch: base_conversion * onair_uplift * weight * float(traffic[ch][a:b].sum())
+               for ch in online}
+        lam[phone[0]] = PHONE_ORDERS_PER_SEGMENT_MIN * seg["segment_duration_minutes"] * weight
+        lam[TV_CHANNEL_ID] = TV_CALLIN_ORDERS_PER_SEGMENT_MIN * seg["segment_duration_minutes"] * weight
+        # Only orders landing inside the window are generated; count the same in expectations.
+        in_window = float(lag_probs[: max(0, min(len(lag_probs), n_min - a))].sum())
+        for ch, l in lam.items():
+            exp_orders[ch] += l * in_window
+            for _ in range(int(rng.poisson(l))):
+                ts = st + timedelta(minutes=float(min(rng.lognormal(math.log(LAG_MEDIAN_MIN), LAG_SIGMA),
+                                                      LAG_CAP_MIN)))
+                if ts < window_end:
+                    add_order(seg["product_id"], ch, ts, "airtime", seg["segment_id"])
+
+    expected = _expected_lift(segments, traffic, window_start, online, presenter_tier,
+                              versions, base_conversion, onair_uplift, lag_probs)
+    expected["orders_by_channel"] = exp_orders
+    return order_lines, returns, truth, expected
 
 
-def _order_channel_probs(n_online: int) -> list[float]:
-    # Non-TV channels share 85%; TV (call-in orders) takes the remaining 15%.
-    base = [0.55, 0.30][:n_online]
-    if len(base) < n_online:
-        base += [0.10] * (n_online - len(base))
-    s = sum(base)
-    base = [b / s * 0.85 for b in base]
-    return base + [0.15]
+def _expected_lift(segments, traffic, window_start, online, presenter_tier, versions,
+                   base_conversion, onair_uplift, lag_probs) -> dict:
+    """Exact expected on-air / off-air online orders given this schedule and traffic."""
+    n_min = len(traffic[online[0]])
+    mask = on_air_mask(segments, window_start, n_min)
+    sessions = sum(traffic[ch].astype(float) for ch in online)
+    s_on, s_off = float(sessions[mask].sum()), float(sessions[~mask].sum())
+    inc_on = inc_off = 0.0
+    for seg in segments:
+        st = _parse(seg["start_ts_utc"])
+        a = _minute_index(seg["start_ts_utc"], window_start)
+        b = a + seg["segment_duration_minutes"]
+        product = next(v for v in versions[seg["product_id"]]
+                       if v.valid_from <= st.date().isoformat() < v.valid_to)
+        weight = (TIER_LIFT_MULTIPLIER[presenter_tier[seg["presenter_id"]]]
+                  * (PRIME_SEGMENT_MULT if st.hour in PRIME_TIME_HOURS else 1.0)
+                  * price_factor(product.list_price))
+        lam = base_conversion * onair_uplift * weight * float(sessions[a:b].sum())
+        idx = a + np.arange(len(lag_probs))
+        keep = idx < n_min
+        inc_on += lam * float(lag_probs[keep][mask[idx[keep]]].sum())
+        inc_off += lam * float(lag_probs[keep][~mask[idx[keep]]].sum())
+    b_on, b_off = base_conversion * s_on, base_conversion * s_off
+    rate_on = (b_on + inc_on) / s_on if s_on else float("nan")
+    rate_off = (b_off + inc_off) / s_off if s_off else float("nan")
+    return {
+        "expected_measured_lift": rate_on / rate_off - 1 if s_on and s_off else None,
+        "lift_on_air_minutes": inc_on / b_on if b_on else None,
+        "expected_onair_orders": b_on + inc_on,
+        "expected_offair_orders": b_off + inc_off,
+        "incremental_share_outside_window": inc_off / (inc_on + inc_off) if inc_on + inc_off else None,
+    }
 
 
 def _make_order_line(rng, line_id, order_id, product: Product, channel_id, ts) -> dict:
-    qty = int(rng.choice([1, 1, 1, 2, 2, 3], p=[0.45, 0.2, 0.1, 0.13, 0.07, 0.05]))
+    qty = int(rng.choice([1, 2, 3], p=[0.75, 0.2, 0.05]))
     unit_price_paid = round(product.list_price * rng.uniform(0.7, 1.0), 2)
     gross = round(unit_price_paid * qty, 2)
     discount = round(gross * rng.uniform(0.0, 0.15), 2)
-    net = round(gross - discount, 2)
     return {
         "order_line_id": line_id,
         "order_id": order_id,
@@ -387,31 +466,30 @@ def _make_order_line(rng, line_id, order_id, product: Product, channel_id, ts) -
         "unit_price_paid": unit_price_paid,
         "gross_amount": gross,
         "discount_amount": discount,
-        "net_amount": net,
+        "net_amount": round(gross - discount, 2),
     }
 
 
-def _maybe_return(rng, ol: dict, product: Product, cat_return_rate, returns: list, return_id_ref: list):
-    rate = cat_return_rate.get(product.category, 0.1)
+def return_probability(product: Product) -> float:
+    rate = dict(CATEGORIES).get(product.category, 0.1)
     if product.list_price_band in ("premium", "luxury"):
-        rate *= 1.2
-    if rng.random() < rate:
-        returned_qty = int(rng.integers(1, ol["quantity"] + 1))
-        refund = round(ol["net_amount"] * (returned_qty / ol["quantity"]), 2)
-        return_id_ref[0] += 1
-        ret_ts = _parse(ol["event_ts_utc"]) + timedelta(days=float(rng.uniform(1, 21)))
-        reason = str(rng.choice(
-            ["size_fit", "not_as_described", "changed_mind", "damaged", "late_delivery"],
-            p=[0.4, 0.2, 0.25, 0.1, 0.05],
-        ))
-        returns.append({
-            "return_id": return_id_ref[0],
-            "order_line_id": ol["order_line_id"],
-            "returned_qty": returned_qty,
-            "refund_amount": refund,
-            "return_ts_utc": _iso(ret_ts),
-            "reason_code": reason,
-        })
+        rate *= PREMIUM_RETURN_MULT
+    return rate
+
+
+def _maybe_return(rng, ol: dict, product: Product, returns: list, ids: _Ids) -> None:
+    if rng.random() >= return_probability(product):
+        return
+    ids.ret += 1
+    returned_qty = int(rng.integers(1, ol["quantity"] + 1))
+    returns.append({
+        "return_id": ids.ret,
+        "order_line_id": ol["order_line_id"],
+        "returned_qty": returned_qty,
+        "refund_amount": round(ol["net_amount"] * returned_qty / ol["quantity"], 2),
+        "return_ts_utc": _iso(_parse(ol["event_ts_utc"]) + timedelta(days=float(rng.uniform(1, 21)))),
+        "reason_code": str(rng.choice(RETURN_REASONS, p=RETURN_REASON_PROBS)),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +504,10 @@ def _iso(dt: datetime) -> str:
 
 def _parse(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def _minute_index(ts: str, window_start: datetime) -> int:
+    return int((_parse(ts) - window_start).total_seconds() // 60)
 
 
 def _write_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
@@ -486,32 +568,62 @@ def inject_dirt(rng: np.random.Generator, order_lines: list[dict],
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def planted_parameters(base_conversion: float, onair_uplift: float, halo: float) -> dict:
+    return {
+        "base_conversion": base_conversion,
+        "onair_uplift": onair_uplift,
+        "halo": halo,
+        "tier_multipliers": TIER_LIFT_MULTIPLIER,
+        "prime_segment_mult": PRIME_SEGMENT_MULT,
+        "prime_hours_utc": sorted(PRIME_TIME_HOURS),
+        "price_factor": "clip(2 - list_price / 400, 0.4, 1.8)",
+        "phone_base_conversion": PHONE_BASE_CONVERSION,
+        "phone_orders_per_segment_min": PHONE_ORDERS_PER_SEGMENT_MIN,
+        "tv_callin_orders_per_segment_min": TV_CALLIN_ORDERS_PER_SEGMENT_MIN,
+        "baseline_traffic_mean": {str(k): v[0] for k, v in BASELINE_TRAFFIC.items()},
+        "category_return_rates": dict(CATEGORIES),
+        "premium_return_mult": PREMIUM_RETURN_MULT,
+        "return_reason_probs": dict(zip(RETURN_REASONS, RETURN_REASON_PROBS)),
+        "lag": {"distribution": "lognormal", "median_min": LAG_MEDIAN_MIN,
+                "sigma": LAG_SIGMA, "cap_min": LAG_CAP_MIN,
+                "share_within_30_after_10_min_segment": round(_lag_cdf(40), 3)},
+        "attribution_window_tail_min": LAG_MINUTES,
+        "addon_order_share": ADDON_ORDER_SHARE,
+    }
+
+
 def generate(out_dir: str, start: datetime, days: int, seed: int,
              n_products: int, n_presenters: int, order_seq_start: int,
              dirty: bool = False, dirty_rate: float = 0.02,
              segment_seq_start: int = 0, dim_seed: int | None = None,
-             dim_start: datetime | None = None) -> dict:
+             dim_start: datetime | None = None, dim_days: int | None = None,
+             base_conversion: float = BASE_CONVERSION, onair_uplift: float = ONAIR_UPLIFT,
+             halo: float = HALO) -> dict:
     """Generate one batch into out_dir and return its manifest.
 
-    dim_seed / dim_start fix the dimension tables independently of the fact seed and
-    window, so successive live batches describe the same products and presenters.
+    dim_seed / dim_start / dim_days fix the dimension tables independently of the fact seed
+    and window, so successive live batches describe the same products and presenters.
     """
     os.makedirs(out_dir, exist_ok=True)
     if dim_seed is None:
         dim_seed = seed
     dim_rng = np.random.default_rng(dim_seed)
-    products = build_products(dim_rng, n_products, dim_start or start)
+    products = build_products(dim_rng, n_products, dim_start or start, dim_days or days)
     presenters = build_presenters(dim_rng, n_presenters)
     shows = build_shows()
     # With a single seed, keep one RNG stream so standalone output stays reproducible.
     rng = dim_rng if dim_seed == seed else np.random.default_rng(seed)
 
+    total_minutes = days * 24 * 60
     segments = build_airtime_segments(rng, products, presenters, shows, start, days,
                                       segment_seq_start)
-    traffic = build_traffic(rng, segments, start, days)
-    order_lines, returns = build_orders_and_returns(
-        rng, products, presenters, segments, start, days, order_seq_start,
+    mask = on_air_mask(segments, start, total_minutes)
+    traffic = build_traffic(rng, mask, start, halo)
+    order_lines, returns, truth, expected = build_orders_and_returns(
+        rng, products, presenters, segments, traffic, start, order_seq_start,
+        base_conversion, onair_uplift,
     )
+    order_lines.sort(key=lambda o: o["order_line_id"])
 
     # Dirt goes only into the JSON feed (landed as VARIANT); the typed CSVs stay clean
     # so a strict COPY INTO never aborts on them.
@@ -522,6 +634,12 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
         dirt_manifest = inject_dirt(rng, json_order_lines, n_products, dirty_rate)
 
     channels = [{"channel_id": c, "channel_name": n, "channel_type": t} for c, n, t in CHANNELS]
+    traffic_rows = [
+        {"channel_id": ch, "minute_ts_utc": _iso(start + timedelta(minutes=i)),
+         "concurrent_viewers": int(v) if ch == TV_CHANNEL_ID else 0,
+         "web_sessions": 0 if ch == TV_CHANNEL_ID else int(v)}
+        for ch, series in traffic.items() for i, v in enumerate(series)
+    ]
 
     _write_csv(os.path.join(out_dir, "dim_product.csv"),
                [asdict(p) for p in products],
@@ -544,8 +662,18 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
     _write_csv(os.path.join(out_dir, "fact_returns.csv"), returns,
                ["return_id", "order_line_id", "returned_qty", "refund_amount",
                 "return_ts_utc", "reason_code"])
-    _write_csv(os.path.join(out_dir, "fact_traffic.csv"), traffic,
+    _write_csv(os.path.join(out_dir, "fact_traffic.csv"), traffic_rows,
                ["channel_id", "minute_ts_utc", "concurrent_viewers", "web_sessions"])
+    # Ground truth for validation only. load_to_snowflake.py never loads _truth_* files.
+    truth.sort(key=lambda t: t["order_line_id"])
+    _write_csv(os.path.join(out_dir, "_truth_order_attribution.csv"), truth,
+               ["order_line_id", "true_segment_id", "order_source"])
+
+    planted = planted_parameters(base_conversion, onair_uplift, halo)
+    planted["expected"] = {k: v for k, v in expected.items() if k != "orders_by_channel"}
+    total_exp = sum(expected["orders_by_channel"].values())
+    planted["expected"]["channel_order_share"] = {
+        str(ch): v / total_exp for ch, v in expected["orders_by_channel"].items()} if total_exp else {}
 
     summary = {
         "window_start_utc": _iso(start),
@@ -557,13 +685,15 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
             "presenters": len(presenters),
             "shows": len(shows),
             "airtime_segments": len(segments),
+            "orders": len({o["order_id"] for o in order_lines}),
             "order_lines": len(order_lines),
             "returns": len(returns),
-            "traffic_minutes": len(traffic),
+            "traffic_minutes": len(traffic_rows),
         },
         "max_order_id": max((o["order_id"] for o in order_lines), default=order_seq_start),
         "max_order_line_id": max((o["order_line_id"] for o in order_lines), default=order_seq_start * 4),
         "max_segment_id": max((s["segment_id"] for s in segments), default=segment_seq_start),
+        "planted": planted,
         "dirty_data": dirt_manifest,
     }
     with open(os.path.join(out_dir, "_batch_manifest.json"), "w", encoding="utf-8") as f:
@@ -579,6 +709,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42, help="RNG seed")
     ap.add_argument("--products", type=int, default=120, help="number of products")
     ap.add_argument("--presenters", type=int, default=10, help="number of presenters")
+    ap.add_argument("--base-conversion", type=float, default=BASE_CONVERSION,
+                    help="baseline orders per online session")
+    ap.add_argument("--onair-uplift", type=float, default=ONAIR_UPLIFT,
+                    help="incremental conversion of exposed sessions, relative to baseline (0 = no effect)")
+    ap.add_argument("--halo", type=float, default=HALO,
+                    help="online session multiplier while a segment window is open")
     ap.add_argument("--order-seq-start", type=int, default=0,
                     help="order id offset; ids start at this value + 1")
     ap.add_argument("--segment-seq-start", type=int, default=0,
@@ -588,14 +724,19 @@ def main() -> None:
                          "into the JSON order-line feed")
     ap.add_argument("--dirty-rate", type=float, default=0.02,
                     help="fraction of rows per corruption type when --dirty is set (default 2%%)")
+    ap.add_argument("--quiet", action="store_true", help="don't print the manifest")
     args = ap.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     summary = generate(args.out, start, args.days, args.seed,
                        args.products, args.presenters, args.order_seq_start,
                        dirty=args.dirty, dirty_rate=args.dirty_rate,
-                       segment_seq_start=args.segment_seq_start)
-    print(json.dumps(summary, indent=2))
+                       segment_seq_start=args.segment_seq_start,
+                       base_conversion=args.base_conversion,
+                       onair_uplift=args.onair_uplift, halo=args.halo)
+    if not args.quiet:
+        print(json.dumps({k: summary[k] for k in ("window_start_utc", "days", "seed", "counts")}, indent=2))
+        print(f"expected measured lift: {summary['planted']['expected']['expected_measured_lift']:+.1%}")
 
 
 if __name__ == "__main__":

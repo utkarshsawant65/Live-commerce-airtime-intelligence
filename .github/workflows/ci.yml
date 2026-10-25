@@ -41,10 +41,13 @@ jobs:
         run: |
           dbt deps
           dbt parse --no-partial-parse --target dev
-      - name: Generator and z-test smoke test
+      - name: Python tests
+        run: python -m pytest -q
+      - name: Generator, z-test and validation smoke test
         run: |
-          python generator/generate_batch.py --out generator/output --days 2 --seed 42
+          python generator/generate_batch.py --out generator/output --days 2 --seed 42 --quiet
           python analysis/conversion_lift_test.py --in generator/output
+          python analysis/validate_against_truth.py --in generator/output
 
   # Secrets can't be read in a job-level `if`, so expose their presence as an output.
   check-secrets:

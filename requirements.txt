@@ -13,3 +13,6 @@ sqlfluff-templater-dbt>=3.0,<5
 
 # Reads .env for local credentials
 python-dotenv>=1.0,<2
+
+# Development: tests (also run in CI)
+pytest>=8.0,<10

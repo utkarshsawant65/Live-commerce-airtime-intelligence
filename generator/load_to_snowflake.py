@@ -116,7 +116,10 @@ def load(in_dir: str, truncate: bool, on_error: str = "abort_statement") -> None
     cur = conn.cursor()
     stage = "@raw.stg_landing"
     try:
+        # Only the RAW_TABLES files are loaded. Ground truth (_truth_*.csv) and the manifest
+        # stay local: the pipeline must measure the planted parameters without seeing them.
         for table, ddl in RAW_TABLES.items():
+            assert not table.startswith("_truth"), "ground-truth files must never be loaded"
             csv_path = os.path.join(in_dir, f"{table}.csv")
             if not os.path.exists(csv_path):
                 print(f"  skip {table}: no file at {csv_path}")

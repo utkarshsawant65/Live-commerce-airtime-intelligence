@@ -3,73 +3,30 @@ One-sided two-proportion z-test: is online conversion (distinct orders / web ses
 higher on air than off air?
 
 Counts come from marts.mart_conversion_windows (--from-snowflake) or are recomputed from
-the generated CSVs with the same rules: online channels only, and a minute is on air if
-it falls in any segment's [start, end + 30 min) window. Each session is treated as an
-independent trial, so this is a population-level lift, not a per-user causal estimate.
+the generated CSVs with the same rules (analysis/offline_rules.py). Sessions are treated as
+independent trials; --bootstrap-days adds a day-level bootstrap CI that relaxes that.
+On generated data this measures a planted effect; the manifest's expected lift is printed
+for comparison.
 
 Usage:
     python analysis/conversion_lift_test.py --in generator/output
+    python analysis/conversion_lift_test.py --in generator/output --bootstrap-days 2000
     python analysis/conversion_lift_test.py --from-snowflake
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import datetime as dt
 import math
 import os
+import random
 import sys
+from statistics import NormalDist
 
-LAG_MINUTES = 30  # must match dbt var attribution_lag_minutes
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from offline_rules import conversion_counts, conversion_counts_by_day, load_batch  # noqa: E402
 
 Counts = dict[str, dict[str, int]]
-
-
-def _parse_ts(s: str) -> dt.datetime:
-    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
-
-
-def _minute(s: str) -> int:
-    return int(_parse_ts(s).timestamp()) // 60
-
-
-def _read_csv(path: str) -> list[dict]:
-    with open(path, encoding="utf-8", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def counts_from_csv(in_dir: str) -> Counts:
-    """On-air / off-air distinct orders and sessions for online channels, from the CSVs."""
-    paths = {name: os.path.join(in_dir, f"{name}.csv")
-             for name in ("dim_channel", "fact_airtime_segment", "fact_order_line", "fact_traffic")}
-    for p in paths.values():
-        if not os.path.exists(p):
-            sys.exit(f"Missing {p}. Run the generator first: python generator/generate_batch.py")
-
-    online = {c["channel_id"] for c in _read_csv(paths["dim_channel"])
-              if c["channel_type"] == "online"}
-
-    on_air_minutes: set[int] = set()
-    for s in _read_csv(paths["fact_airtime_segment"]):
-        start = _minute(s["start_ts_utc"])
-        end = _minute(s["end_ts_utc"]) + LAG_MINUTES
-        on_air_minutes.update(range(start, end))
-
-    orders: dict[str, set[str]] = {"on_air": set(), "off_air": set()}
-    for o in _read_csv(paths["fact_order_line"]):
-        if o["channel_id"] in online:
-            state = "on_air" if _minute(o["event_ts_utc"]) in on_air_minutes else "off_air"
-            orders[state].add(o["order_id"])
-
-    sessions = {"on_air": 0, "off_air": 0}
-    for t in _read_csv(paths["fact_traffic"]):
-        if t["channel_id"] in online:
-            state = "on_air" if _minute(t["minute_ts_utc"]) in on_air_minutes else "off_air"
-            sessions[state] += int(t["web_sessions"])
-
-    return {state: {"orders": len(orders[state]), "sessions": sessions[state]}
-            for state in ("on_air", "off_air")}
 
 
 def counts_from_snowflake() -> Counts:
@@ -108,15 +65,53 @@ def two_proportion_z_test(x1: int, n1: int, x2: int, n2: int) -> tuple[float, fl
     return p1, p2, z, p_value
 
 
+def lift_intervals(x1: int, n1: int, x2: int, n2: int, level: float = 0.95):
+    """Wald CI for p1 - p2 and log-ratio CI for p1 / p2 - 1. Relative CI is None if a count is 0."""
+    zq = NormalDist().inv_cdf(0.5 + level / 2)
+    p1, p2 = x1 / n1, x2 / n2
+    se_diff = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+    diff = (p1 - p2 - zq * se_diff, p1 - p2 + zq * se_diff)
+    if x1 == 0 or x2 == 0:
+        return diff, None
+    se_log = math.sqrt(1 / x1 - 1 / n1 + 1 / x2 - 1 / n2)
+    log_rr = math.log(p1 / p2)
+    rel = (math.exp(log_rr - zq * se_log) - 1, math.exp(log_rr + zq * se_log) - 1)
+    return diff, rel
+
+
+def bootstrap_days(by_day: dict, reps: int, seed: int = 0, level: float = 0.95):
+    """Percentile CI of the relative lift, resampling whole days with replacement."""
+    days = list(by_day.values())
+    rnd = random.Random(seed)
+    lifts = []
+    for _ in range(reps):
+        sample = [rnd.choice(days) for _ in days]
+        tot = {s: {k: sum(d[s][k] for d in sample) for k in ("orders", "sessions")}
+               for s in ("on_air", "off_air")}
+        if min(tot["on_air"]["sessions"], tot["off_air"]["sessions"], tot["off_air"]["orders"]) == 0:
+            continue
+        lifts.append((tot["on_air"]["orders"] / tot["on_air"]["sessions"])
+                     / (tot["off_air"]["orders"] / tot["off_air"]["sessions"]) - 1)
+    lifts.sort()
+    if len(lifts) < 20:
+        return None
+    lo = lifts[int((1 - level) / 2 * len(lifts))]
+    hi = lifts[min(len(lifts) - 1, int((0.5 + level / 2) * len(lifts)))]
+    return lo, hi
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Two-proportion z-test for airtime conversion lift.")
     ap.add_argument("--in", dest="in_dir", default="generator/output")
     ap.add_argument("--from-snowflake", action="store_true",
                     help="read counts from marts.mart_conversion_windows instead of CSVs")
     ap.add_argument("--alpha", type=float, default=0.05, help="significance level")
+    ap.add_argument("--bootstrap-days", type=int, default=0, metavar="REPS",
+                    help="also report a day-level bootstrap CI with this many resamples")
     args = ap.parse_args()
 
-    counts = counts_from_snowflake() if args.from_snowflake else counts_from_csv(args.in_dir)
+    batch = None if args.from_snowflake else load_batch(args.in_dir)
+    counts = counts_from_snowflake() if args.from_snowflake else conversion_counts(batch)
     empty = {"orders": 0, "sessions": 0}
     on = counts.get("on_air", empty)
     off = counts.get("off_air", empty)
@@ -134,18 +129,33 @@ def main() -> None:
         sys.exit(1)
 
     p_on, p_off, z, p_value = result
-    lift_abs = p_on - p_off
+    level = 1 - args.alpha
+    diff_ci, rel_ci = lift_intervals(on["orders"], on["sessions"], off["orders"], off["sessions"], level)
     lift_rel = (p_on / p_off - 1) if p_off > 0 else float("inf")
-    print(f"  conversion    : on-air {p_on:.5f}, off-air {p_off:.5f}")
-    print(f"  absolute lift : {lift_abs:+.5f}  ({lift_abs * 1000:+.2f} per 1,000 sessions)")
-    print(f"  relative lift : {lift_rel:+.1%}")
+    print(f"  conversion    : on-air {p_on:.5%}, off-air {p_off:.5%}")
+    print(f"  absolute lift : {(p_on - p_off) * 1000:+.3f} per 1,000 sessions "
+          f"({level:.0%} CI {diff_ci[0] * 1000:+.3f} to {diff_ci[1] * 1000:+.3f})")
+    rel_txt = f"({level:.0%} CI {rel_ci[0]:+.1%} to {rel_ci[1]:+.1%})" if rel_ci else "(CI undefined)"
+    print(f"  relative lift : {lift_rel:+.1%} {rel_txt}")
+    if args.bootstrap_days and batch is not None:
+        boot = bootstrap_days(conversion_counts_by_day(batch), args.bootstrap_days, level=level)
+        if boot:
+            print(f"  day bootstrap : {level:.0%} CI {boot[0]:+.1%} to {boot[1]:+.1%} "
+                  f"({len(conversion_counts_by_day(batch))} days)")
     print(f"  z-statistic   : {z:.3f}")
     print(f"  p-value       : {p_value:.3e}  (one-sided H1: p_on_air > p_off_air)")
+
+    expected = (batch.manifest.get("planted", {}).get("expected", {}) if batch else {})
+    planted = expected.get("expected_measured_lift")
+    if planted is not None:
+        inside = rel_ci is not None and rel_ci[0] <= planted <= rel_ci[1]
+        print(f"  planted lift  : {planted:+.1%} (expected from generator parameters; "
+              f"{'inside' if inside else 'outside'} the CI)")
     print("-" * 70)
     if p_value < args.alpha:
-        print(f"  Reject H0 at alpha={args.alpha}: on-air conversion is significantly higher.")
+        print(f"  Reject H0 at alpha={args.alpha}: on-air conversion is higher than off-air.")
     else:
-        print(f"  Fail to reject H0 at alpha={args.alpha}: no significant lift.")
+        print(f"  Fail to reject H0 at alpha={args.alpha}: no detectable lift.")
     print("=" * 70)
 
 

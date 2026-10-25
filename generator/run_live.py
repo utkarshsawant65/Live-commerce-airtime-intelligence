@@ -70,7 +70,8 @@ def main() -> None:
         summary = gb.generate(args.out, start, args.batch_days, seed,
                               n_products=args.products, n_presenters=args.presenters,
                               order_seq_start=order_seq, segment_seq_start=segment_seq,
-                              dim_seed=args.seed, dim_start=default_start)
+                              dim_seed=args.seed, dim_start=default_start,
+                              dim_days=args.iterations * args.batch_days)
         print(f"  generated {summary['counts']['order_lines']} order lines")
 
         if not args.no_load:
