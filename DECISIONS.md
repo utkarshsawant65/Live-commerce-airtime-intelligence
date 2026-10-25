@@ -195,8 +195,8 @@ The main design choices, the alternative considered, and why. Each is rated:
 
 - Snowflake verification comes from a trial account (October 2026). CI runs the Snowflake
   build only while the secrets are configured, and each run reloads the shared RAW schema.
-- The Power BI report was built on the earlier generator and needs a refresh from a
-  documented dataset (`--days 90 --seed 42`). The `.pbix` is not in the repo.
+- The Power BI report (`.pbix`) is not in the repo; screenshots and figures come from the
+  dashboard dataset (`--start 2026-06-01 --days 92 --seed 42`).
 - Row-level security in the Power BI report is planned; it cannot be verified from the repo
   because the `.pbix` is not included. The access control in the repo is Snowflake RBAC
   (`snowflake/00_setup.sql`).

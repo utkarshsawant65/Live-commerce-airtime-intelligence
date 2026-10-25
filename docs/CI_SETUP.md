@@ -27,7 +27,7 @@ Snowflake build, data tests, unit test and lint run only when the secrets are co
 **Secrets and the shared RAW schema.** A green `build-and-test` run against a Snowflake
 trial account was recorded on 25 October 2026. Every run truncates and reloads RAW with a
 2-day batch, so with the secrets in place, any PR replaces whatever dataset RAW holds (for
-example the 90-day dashboard dataset). Remove the secrets once the run you need is done, or
+example the dashboard dataset). Remove the secrets once the run you need is done, or
 point CI at its own database or account. Without them the job is skipped, not failed.
 
 **Use a service user for CI.** Key-pair login builds a token from the account and user

@@ -366,52 +366,55 @@ suspended and the Dynamic Table is suspended right after creation. See
 ## 13. Dashboard
 
 Four Power BI pages in Import mode, reading the marts only. The `.pbix` is not in the repo.
-The report was built on an earlier version of the generator; it will be refreshed from a
-documented dataset (`python generator/generate_batch.py --out generator/output --days 90
---seed 42`). No figures are quoted here until then.
+The report reads the dashboard dataset, June to August 2026
+(`python generator/generate_batch.py --out generator/output --start 2026-06-01 --days 92 --seed 42`); figures below are
+from that dataset and match the marts queried directly.
 
 On generated data the pages show planted parameters coming back through the pipeline. They
 are a check on the pipeline, not business findings.
 
 **Overview** (slicer: month)
-- Cards: revenue per broadcast minute, net revenue after returns, GMV, return rate.
-- Net revenue over time with airtime-attributed revenue as a band.
-- Revenue by channel. The order mix should match `planted.expected.channel_order_share` in
-  the manifest (about 41% Web Shop, 26% Mobile App, 25% Call Centre, 8% TV Linear on the
-  sample batch).
+- Cards: €257 revenue per broadcast minute, €19.06M net revenue after returns, €23.82M GMV,
+  13.69% return rate (units).
+- Net revenue by month (June, July, August) with airtime-attributed revenue as a band.
+- Revenue by channel. The order mix matches `planted.expected.channel_order_share`: planted
+  40.4 / 25.8 / 25.8 / 8.1% (Web Shop / Mobile App / Call Centre / TV Linear), measured
+  40.5 / 25.8 / 25.9 / 7.9%.
 - Top products by net revenue with their return rates alongside.
 
 **Airtime** (slicer: presenter experience tier)
 - Airtime-attributed revenue, airtime share and broadcast minutes.
 - Revenue by presenter, coloured by tier. Tier multipliers are planted at 1.6 (star),
-  1.25 (established) and 1.05 (rookie), so star presenters should earn more per broadcast
-  minute than established ones, and established more than rookies, after allowing for
-  product price and time slot.
-- Revenue per broadcast minute by daypart. The prime-time weight is planted at 1.6 and online
-  traffic is 2.1× in prime time, so prime time should lead.
+  1.25 (established) and 1.05 (rookie). Revenue per broadcast minute comes out star €307,
+  established €249, rookie €239. Revenue per minute also depends on product prices and on
+  which time slots each presenter happened to host, so the gaps are not the pure multipliers;
+  the ratios themselves are recovered in `docs/VALIDATION.md`.
+- Revenue per broadcast minute by daypart: prime time €378 vs €145-161 elsewhere, the
+  planted 1.6× prime weight combined with 2.1× prime-time traffic.
 - Category × presenter heatmap. Each show draws from fixed categories and each airing has
   one presenter, so a presenter's category mix reflects which shows they happened to host.
   The generator plants no presenter-category effect.
 
 **Conversion** (on-air vs off-air split throughout)
-- On-air vs off-air conversion with the z-test result, next to the planted lift from the
-  manifest.
+- On-air vs off-air online conversion: 3.59% vs 1.64%, lift +119.0% (95% CI +116.0% to
+  +122.0%) against a planted +115.6%.
 - Conversion by daypart and by channel for each state.
 - Orders and web sessions by state, to show the lift is a rate change and not just more
   traffic.
 
 **Returns** (slicer: price band)
 - Return rate, refunded value and units returned.
-- Return rate by category, which should sit near the planted rates: Fashion 28%,
-  Jewellery 24%, Beauty 10%, Home & Living 8%, Wellness 7%, Electronics 6%.
-- Reasons, which should follow the planted mix: size/fit 40%, changed mind 25%, not as
-  described 20%, damaged 10%, late delivery 5%.
+- Return rate by category (units): Fashion 26.3%, Jewellery 23.1%, Beauty 9.9%, Home &
+  Living 7.7%, Wellness 6.6%, Electronics 5.5%. Planted line-level rates are 28 / 24 / 10 /
+  8 / 7 / 6%; unit rates sit a little lower because partial returns are allowed.
+- Reasons: size/fit 40.0%, changed mind 24.9%, not as described 19.9%, damaged 10.1%, late
+  delivery 5.1% (planted 40 / 25 / 20 / 10 / 5%).
 - Category × price band: premium and luxury bands are planted at 1.2× the category rate.
 
 ## 14. Status
 
 - Run end to end on a Snowflake trial account on 25 October 2026 with the current code:
-  90-day dataset loaded, `dbt build --full-refresh` passing all 218 nodes, sqlfluff clean,
+  dashboard dataset loaded, `dbt build --full-refresh` passing all 218 nodes, sqlfluff clean,
   and a green CI `build-and-test` run.
 - Checked on Snowflake: mart z-test counts identical to the offline rules; dirty-batch
   quarantine counts equal the manifest; incremental runs pick up late-loaded rows without
