@@ -45,9 +45,9 @@ where product_id = 1
      * old row: original values, dbt_valid_to = time of this snapshot run
      * new row: category = Jewellery, list_price = 249.99, dbt_valid_to = NULL
 
-   The new version is effective from the snapshot run that captured the change, so
-   in dim_product orders with event_ts_utc before that run resolve to the old version
-   and later orders to the new one.
+   The snapshot dates the new version by the run that captured it (capture time).
+   dim_product is unaffected by this timing: it follows the source's own valid_from /
+   valid_to, so an in-place edit like this one changes that version's attributes.
    ---------------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------------

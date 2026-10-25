@@ -107,12 +107,12 @@ grant select on all views     in schema live_commerce.marts to role role_bi_read
 grant select on future views  in schema live_commerce.marts to role role_bi_reader;
 
 -- ----------------------------------------------------------------------------
--- 4. Assign roles to users. Replace the placeholders and uncomment.
+-- 4. Grant the three roles to the user running this script.
 -- ----------------------------------------------------------------------------
--- set my_user = '<YOUR_USER>';
--- grant role role_loader      to user identifier($my_user);
--- grant role role_transformer to user identifier($my_user);
--- grant role role_bi_reader   to user identifier($my_user);
+set my_user = current_user();
+grant role role_loader      to user identifier($my_user);
+grant role role_transformer to user identifier($my_user);
+grant role role_bi_reader   to user identifier($my_user);
 
 -- The CI job both loads RAW and runs dbt, so its user needs both roles.
 -- set ci_user = '<CI_USER>';

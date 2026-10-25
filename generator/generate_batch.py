@@ -684,6 +684,8 @@ def generate(out_dir: str, start: datetime, days: int, seed: int,
         "days": days,
         "seed": seed,
         "dim_seed": dim_seed,
+        "dim_start_utc": _iso(dim_start or start),
+        "dim_days": dim_days or days,
         "counts": {
             "products_versions": len(products),
             "presenters": len(presenters),
