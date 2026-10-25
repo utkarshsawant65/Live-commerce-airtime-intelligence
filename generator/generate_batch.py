@@ -52,7 +52,7 @@ EXPERIENCE_TIERS = ["rookie", "established", "star"]
 TIER_SHARE = [0.3, 0.5, 0.2]
 
 # --- Conversion model (online channels) -------------------------------------------
-BASE_CONVERSION = 0.00015   # orders per web session, on or off air
+BASE_CONVERSION = 0.015     # orders per web session, on or off air
 ONAIR_UPLIFT = 0.63         # incremental orders per exposed session, relative to baseline
 HALO = 2.9                  # online sessions multiplier while a segment window is open
 
@@ -67,13 +67,15 @@ def price_factor(list_price: float) -> float:
 
 
 # --- Phone and TV orders (outside the conversion metric) --------------------------
-PHONE_BASE_CONVERSION = 0.002          # orders per call-centre contact
+PHONE_BASE_CONVERSION = 0.2            # orders per call-centre contact
 PHONE_ORDERS_PER_SEGMENT_MIN = 0.20    # x segment weight
 TV_CALLIN_ORDERS_PER_SEGMENT_MIN = 0.20
 
 # --- Traffic -----------------------------------------------------------------------
-# Mean sessions (online) / contacts (phone) / viewers (broadcast) per minute.
-BASELINE_TRAFFIC = {1: (4000, 1200), 2: (1100, 280), 3: (700, 180), 4: (120, 40)}
+# Mean per minute: viewers (TV), sessions (online), contacts (phone). Online and phone
+# counts are Poisson; TV viewers are normal with this standard deviation.
+BASELINE_TRAFFIC = {1: 4000, 2: 11.0, 3: 7.0, 4: 1.2}
+TV_VIEWERS_STD = 1200
 PRIME_TIME_HOURS = set(range(18, 23))  # 18:00-22:59 UTC
 
 
@@ -304,9 +306,11 @@ def build_traffic(rng, mask: np.ndarray, window_start: datetime, halo: float) ->
     hour_mult = np.array([hour_traffic_mult(h) for h in range(24)])[hours]
     traffic = {}
     for ch_id, _name, ch_type in CHANNELS:
-        mean, std = BASELINE_TRAFFIC[ch_id]
-        mu = mean * hour_mult * (np.where(mask, halo, 1.0) if ch_type == "online" else 1.0)
-        traffic[ch_id] = np.maximum(0, rng.normal(mu, std * hour_mult)).astype(np.int64)
+        mu = BASELINE_TRAFFIC[ch_id] * hour_mult * (np.where(mask, halo, 1.0) if ch_type == "online" else 1.0)
+        if ch_type == "broadcast":
+            traffic[ch_id] = np.maximum(0, rng.normal(mu, TV_VIEWERS_STD * hour_mult)).astype(np.int64)
+        else:
+            traffic[ch_id] = rng.poisson(mu).astype(np.int64)
     return traffic
 
 
@@ -580,7 +584,7 @@ def planted_parameters(base_conversion: float, onair_uplift: float, halo: float)
         "phone_base_conversion": PHONE_BASE_CONVERSION,
         "phone_orders_per_segment_min": PHONE_ORDERS_PER_SEGMENT_MIN,
         "tv_callin_orders_per_segment_min": TV_CALLIN_ORDERS_PER_SEGMENT_MIN,
-        "baseline_traffic_mean": {str(k): v[0] for k, v in BASELINE_TRAFFIC.items()},
+        "baseline_traffic_mean": {str(k): v for k, v in BASELINE_TRAFFIC.items()},
         "category_return_rates": dict(CATEGORIES),
         "premium_return_mult": PREMIUM_RETURN_MULT,
         "return_reason_probs": dict(zip(RETURN_REASONS, RETURN_REASON_PROBS)),
