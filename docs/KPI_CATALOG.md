@@ -9,12 +9,16 @@ Conventions:
 - Timestamps are UTC throughout the warehouse.
 - Marts store additive base measures. Ratios are computed in BI from summed numerators and
   denominators, never stored pre-divided at a grain where they would not roll up.
+- Daypart and the prime-time flag come from one macro (`dbt/macros/daypart.sql`): morning
+  05-11, afternoon 12-17, prime time 18-22 (18:00-22:59 UTC, as in the generator), late
+  night otherwise.
 
 ## Base measures: `mart_kpi_metrics`
 
 Grain: `event_date` × `product_key` × `presenter_key` × `channel_key` × `attributed_segment_id`.
 The presenter is the attributed segment's presenter; organic orders get the unknown presenter.
-Returns are aligned to the date and keys of the original sale.
+`product_key` is the product version valid at the order's event time. Returns are aligned to
+the date and keys of the original sale.
 
 | KPI | Column | Formula | Additivity |
 |---|---|---|---|
@@ -26,10 +30,11 @@ Returns are aligned to the date and keys of the original sale.
 | Airtime-attributed revenue | `airtime_attributed_revenue` | `Σ net_amount where is_airtime_attributed` | additive |
 | Units sold | `units_sold` | `Σ quantity` | additive |
 | Returned units | `returned_units` | `Σ returned_qty` | additive |
-| Distinct orders | `distinct_orders` | `COUNT(DISTINCT order_id)` | not additive across products (a multi-product order appears in several rows) |
+| Distinct orders | `distinct_orders` | `COUNT(DISTINCT order_id)` | not additive across products (an order with add-on lines appears in several rows) |
 
 `is_airtime_attributed` comes from the attribution model: the order line matched a segment
-for its own product within `[start, end + 30 min)`.
+for its own product within `[start, end + 30 min)`. Add-on lines for other products in the
+same order are attributed on their own product, so they are usually organic.
 
 ### Ratios (computed in BI)
 
@@ -39,15 +44,25 @@ for its own product within `[start, end + 30 min)`.
 | Return rate | `Returned units ÷ Units sold` | in `[0, 1]`; a singular test checks returns never exceed sales per line |
 | Airtime revenue share | `Airtime-attributed revenue ÷ Total net revenue` | share of revenue tied to a segment |
 
-## Revenue per broadcast minute: `mart_segment_performance`
+## Segment revenue: `mart_segment_performance`
 
-Grain: one row per segment (`segment_id`).
+Grain: one row per segment (`segment_id`). Attributed revenue is the net revenue of order
+lines attributed to the segment over its whole window: the airtime plus the 30-minute tail
+(`attribution_lag_minutes`).
 
-| | |
-|---|---|
-| Formula | `attributed_revenue ÷ segment_duration_minutes` |
-| Inputs | net revenue, orders and units of order lines attributed to the segment |
-| Rolls up | sum `attributed_revenue` and `segment_duration_minutes` first, then divide (by presenter, product, show, daypart, date) |
+| KPI | Column | Formula |
+|---|---|---|
+| Attributed orders, units, revenue | `attributed_orders`, `attributed_units`, `attributed_revenue` | distinct orders, `Σ quantity`, `Σ net_amount` of attributed lines |
+| Revenue per broadcast minute | `revenue_per_broadcast_minute` | `attributed_revenue ÷ segment_duration_minutes` (on-air minutes only) |
+| Revenue per window minute | `revenue_per_window_minute` | `attributed_revenue ÷ (segment_duration_minutes + 30)` |
+
+Revenue per broadcast minute answers what a minute of airtime earns, so it charges the tail's
+orders to the on-air minutes. Revenue per window minute spreads the same revenue over the
+full attribution window; it is lower and penalises short segments less.
+
+Rolling up (by presenter, product, show, daypart, date): sum `attributed_revenue` and
+`segment_duration_minutes` first, then divide. For the window version, add 30 minutes per
+segment to the denominator before dividing.
 
 ## Conversion rate and lift: `mart_conversion_windows`
 
@@ -61,17 +76,21 @@ Grain: `airtime_state` × `event_date` × `channel_key` × `daypart`.
 | Conversion rate | `Σ orders ÷ Σ web_sessions` per state (sum before dividing) |
 | Absolute lift | `rate(on_air) − rate(off_air)` |
 | Relative lift | `rate(on_air) ÷ rate(off_air) − 1` |
-| Significance | one-sided two-proportion z-test in [`analysis/conversion_lift_test.py`](../analysis/conversion_lift_test.py), on the same counts |
+| Significance | one-sided two-proportion z-test in [`analysis/conversion_lift_test.py`](../analysis/conversion_lift_test.py), on the same counts, with 95% CIs for absolute and relative lift (optional day-level bootstrap) |
 
 This on-air rule is about time, not product: any segment makes the minute on air. It is
 separate from `is_airtime_attributed`, which ties an order to its own product's segment and
-drives attributed revenue.
+drives attributed revenue. Call centre and TV call-in orders are outside this metric.
+
+On generated data the expected relative lift is in the batch manifest
+(`planted.expected.expected_measured_lift`); the z-test prints it next to the measured value.
 
 ## Governance
 
 - Power BI connects to `MARTS` only and does not re-implement these formulas beyond the
   ratios above.
 - Base measures are covered by dbt tests (not-null, ranges, relationships to the conformed
-  dimensions), plus singular tests for returns and attribution.
+  dimensions), singular tests for returns, attribution, segment overlap and product-version
+  joins, and a unit test of the attribution window rules.
 - `product`, `presenter`, `channel`, `show`, `date` and `time_minute` are conformed across all
   facts and marts.

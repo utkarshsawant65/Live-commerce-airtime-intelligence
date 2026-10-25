@@ -327,8 +327,11 @@ def main() -> None:
                f"{sweep['max_measured']:+.1%}). The 95% CI contained the planted lift in "
                f"{sweep['coverage']:.0%} of batches.", "",
                "## Halo check", "",
-               "The halo multiplies on-air traffic. Orders follow sessions, so the measured "
-               f"conversion lift should not depend on it ({args.halo_seeds} seeds per value):", "",
+               "The halo multiplies on-air traffic. Orders follow sessions, so a bigger halo does "
+               "not inflate the conversion rate; measured lift follows the planted value at every "
+               "halo. The planted value drifts slightly because airtime orders that arrive after "
+               "the window count in the off-air baseline, and there are more of them when on-air "
+               f"traffic is higher ({args.halo_seeds} seeds per value):", "",
                _md_table([{"halo": f"{h['halo']:.1f}", "planted": f"{h['mean_planted']:+.1%}",
                            "measured": f"{h['mean_measured']:+.1%}", "sd": f"{h['sd_measured']:.1%}"}
                           for h in halos], ["halo", "planted", "measured", "sd"]), ""]

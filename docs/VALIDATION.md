@@ -47,7 +47,7 @@ The pipeline uses 30 minutes. Longer windows catch more late orders but also att
 
 ## Halo check
 
-The halo multiplies on-air traffic. Orders follow sessions, so the measured conversion lift should not depend on it (10 seeds per value):
+The halo multiplies on-air traffic. Orders follow sessions, so a bigger halo does not inflate the conversion rate; measured lift follows the planted value at every halo. The planted value drifts slightly because airtime orders that arrive after the window count in the off-air baseline, and there are more of them when on-air traffic is higher (10 seeds per value):
 
 | halo | planted | measured | sd |
 |---|---|---|---|

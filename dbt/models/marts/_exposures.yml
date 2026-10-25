@@ -5,10 +5,11 @@ exposures:
     label: "Live Commerce Airtime Dashboard"
     type: dashboard
     maturity: high
-    url: https://app.powerbi.com/  # replace with the published report URL
+    url: https://github.com/utkarshsawant65/Live-commerce-airtime-intelligence#dashboard
     description: >
-      Power BI report on revenue per broadcast minute, on-air conversion and returns by
-      presenter, product and channel. Reads only from MARTS.
+      Four-page Power BI report (Import mode) on revenue per broadcast minute, on-air
+      conversion and returns by presenter, product and channel. Reads only from MARTS.
+      The .pbix is not in the repo; the README's dashboard section describes the pages.
     depends_on:
       - ref('mart_kpi_metrics')
       - ref('mart_segment_performance')
@@ -24,5 +25,4 @@ exposures:
       - ref('fact_returns')
       - ref('fact_traffic')
     owner:
-      name: Analytics
-      email: analytics@example.com
+      name: Utkarsh Sawant

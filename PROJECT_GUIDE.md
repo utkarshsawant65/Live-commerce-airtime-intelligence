@@ -2,7 +2,8 @@
 
 How the Live Commerce Airtime Intelligence Platform is put together, layer by layer. Design
 rationale and rejected alternatives are in [DECISIONS.md](DECISIONS.md); KPI formulas are in
-[docs/KPI_CATALOG.md](docs/KPI_CATALOG.md).
+[docs/KPI_CATALOG.md](docs/KPI_CATALOG.md); validation results are in
+[docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## 1. Business case
 
@@ -25,23 +26,23 @@ the business can see which products, presenters and time slots pay off.
 
 ```
 generator/generate_batch.py      CSVs + fact_order_line.json + _batch_manifest.json
-        |
+        |                        (+ _truth_order_attribution.csv, never loaded)
 generator/load_to_snowflake.py   PUT to raw.stg_landing, COPY INTO RAW
         |                        (typed tables for CSV, VARIANT table for JSON)
         v
 RAW --> STAGING --> INTERMEDIATE --> MARTS --> Power BI
         stg_*       attribution      facts, dims, metric marts
            \
-            SNAPSHOTS (dim_product_snapshot, SCD2)
+            SNAPSHOTS (dim_product_snapshot, capture-time audit trail)
 ```
 
 | Layer | Schema | Materialisation | Job |
 |---|---|---|---|
 | Raw | `RAW` | tables (loader) | data as it arrived, plus `loaded_at_utc` |
 | Staging | `STAGING` | views | rename, cast, trim, dedupe; one model per source |
-| Intermediate | none | ephemeral | attribution logic, inlined into `fact_order_line` |
+| Intermediate | `INTERMEDIATE` | view | attribution logic, read by `fact_order_line` |
 | Marts | `MARTS` | tables (`fact_order_line` incremental) | star schema and metric marts |
-| Snapshots | `SNAPSHOTS` | snapshot | product history |
+| Snapshots | `SNAPSHOTS` | snapshot | product audit trail |
 
 Power BI reads `MARTS` only. `generate_schema_name` writes to these exact schema names (no
 `<target>_` prefix), appending `DBT_SCHEMA_SUFFIX` when set (CI uses `_CI`).
@@ -54,16 +55,59 @@ commented out.
 
 ## 3. Data generation and loading
 
-**`generate_batch.py`** builds one consistent batch: 120 products (about 25% with an earlier
-version in the source table), 10 presenters with an experience tier, shows, four channels
-(TV Linear, Web Shop, Mobile App, Call Centre), a broadcast schedule of airtime segments,
-order lines, returns and minute-level traffic. During a segment and the 30 minutes after it,
-orders for the featured product rise across channels, scaled by presenter tier and prime
-time, and online traffic rises too. Off-air there is a baseline of organic orders. All
-timestamps are UTC and a fixed `--seed` makes output reproducible.
+**`generate_batch.py`** builds one consistent batch from named constants at the top of the
+file. All timestamps are UTC and a fixed `--seed` makes output reproducible.
 
-Flags: `--out --start --days --seed --products --presenters --order-seq-start
---segment-seq-start --dirty --dirty-rate`.
+- **Dimensions.** 120 products in six categories. About 25% have an earlier version that
+  ends 30 days before the window, and about 10% change price on a day inside the window;
+  orders are priced from the version valid at order time. 10 presenters with a fixed tier mix
+  of 3 rookie, 5 established and 2 star (shuffled). Four channels: TV Linear, Web Shop,
+  Mobile App, Call Centre.
+- **Schedule.** One TV channel with fixed, non-overlapping show slots, one presenter per show
+  and products drawn from the show's categories. Each show is a run of 5-14 minute segments.
+
+  | Show | Slot (UTC) | Days | Categories |
+  |---|---|---|---|
+  | Morning Glow | 08-11 | all | Beauty, Wellness, Home & Living |
+  | Jewellery Hour | 13-17 | weekdays | Jewellery |
+  | Weekend Style Edit | 13-17 | weekends | Fashion, Beauty |
+  | Prime Time Live | 18-22 | all | any |
+  | Late Night Deals | 22-24 | all | any |
+
+- **Traffic.** Online sessions and call-centre contacts are Poisson counts per minute: Web
+  about 11, App about 7, Call Centre about 1.2, times an hour-of-day multiplier (0.3 before
+  07:00, 2.1 in prime time 18:00-22:59, 0.8 at 23:00, else 1). While any segment window
+  `[start, end + 30 min)` is open, online sessions are multiplied by the halo (`HALO` = 2.9).
+  The halo changes traffic volume only, not the conversion rate.
+- **Online orders.** Driven by sessions. Baseline: each online channel-minute gets
+  Poisson(sessions × `BASE_CONVERSION` = 0.015) orders for a random product. Airtime: each
+  segment gets Poisson(`BASE_CONVERSION` × `ONAIR_UPLIFT` (0.63) × weight × online sessions
+  during the airing) incremental orders for its product, where weight = tier multiplier
+  (rookie 1.05, established 1.25, star 1.6) × 1.6 in prime time × price factor
+  `clip(2 − price / 400, 0.4, 1.8)`.
+- **Response lag.** Each airtime order lands at segment start + lag, lag lognormal (median
+  9 min, sigma 1.25, capped at 360 min). Some arrive after the 30-minute attribution tail and
+  are counted as organic by the pipeline.
+- **Call centre and TV call-in.** Baseline call-centre orders convert contacts at 0.2;
+  per-segment call-centre and TV call-in orders are 0.2 per segment minute × weight. These
+  channels are outside the conversion metric.
+- **Baskets and returns.** 17% of orders get 1-2 add-on lines for other products. Returns
+  follow planted category rates (Fashion 28%, Jewellery 24%, Beauty 10%, Home & Living 8%,
+  Wellness 7%, Electronics 6%; ×1.2 for premium and luxury price bands), arrive 1-21 days
+  later, with reason probabilities size/fit 0.4, changed mind 0.25, not as described 0.2,
+  damaged 0.1, late delivery 0.05.
+- **Resulting scale.** Conversion is about 1.6% off air and 3.6% on air.
+
+Flags: `--out --start --days --seed --products --presenters --base-conversion
+--onair-uplift --halo --order-seq-start --segment-seq-start --dirty --dirty-rate --quiet`.
+
+**Manifest and ground truth.** `_batch_manifest.json` has a `planted` block with every
+parameter above and an `expected` block computed from this batch's schedule and traffic:
+`expected_measured_lift` (what the z-test should measure), `lift_on_air_minutes`,
+`channel_order_share` and `incremental_share_outside_window`. `_truth_order_attribution.csv`
+gives `order_line_id`, `true_segment_id` and `order_source` (`baseline`, `airtime`, or
+`addon` with segment `-1`). Neither is loaded: `load_to_snowflake.py` loads only its
+`RAW_TABLES` and asserts that no `_truth_*` file is among them.
 
 **Dirty mode.** `--dirty` corrupts only the JSON order-line feed; the typed CSVs stay clean so
 a strict `COPY INTO` never aborts. Each corruption type hits its own rows (`--dirty-rate`,
@@ -84,9 +128,9 @@ default 2% per type), and `_batch_manifest.json` records the exact counts:
 comes from `.env` (see `.env.example`).
 
 **`run_live.py`** loops: generate the next window, append it to RAW, optionally `dbt build`
-(`--run-dbt`), wait `--interval` seconds. Other flags: `--iterations --batch-days --start
---seed --products --presenters --no-load`. Dimensions are generated from `--seed` and
-`--start` so they stay the same across batches; the fact seed follows the window. Window
+(`--run-dbt`), wait `--interval` seconds. Other flags: `--out --iterations --batch-days
+--start --seed --products --presenters --no-load`. Dimensions are generated from `--seed`
+and `--start` so they stay the same across batches; the fact seed follows the window. Window
 start and order/segment ids continue from the previous batch's manifest.
 
 ## 4. Staging
@@ -94,7 +138,8 @@ start and order/segment ids continue from the previous batch's manifest.
 One view per source, 1:1: cast types, `trim`/`lower` text, and dedupe with `row_number()`
 keeping the latest load per natural key. No joins across entities.
 
-- `stg_products` keeps every source version (`product_id`, `product_version`).
+- `stg_products` keeps every source version (`product_id`, `product_version`) with its
+  `valid_from_date` / `valid_to_date`.
 - `stg_presenters`, `stg_shows`: latest row per id.
 - `stg_channels` reads the `seed_channel` seed rather than RAW, so channel classification is
   version-controlled.
@@ -111,36 +156,44 @@ that shows schema-on-read and quarantine handling.
 
 ## 5. Product history (SCD2)
 
-`dbt/snapshots/dim_product_snapshot.sql` snapshots the current product row from
-`stg_products` with the `check` strategy on `category`, `list_price_band`, `list_price`,
-`brand` and `product_name`, and `hard_deletes='invalidate'`.
+- **`dim_product`** is an event-time SCD2: one row per source version from `stg_products`,
+  surrogate key on (`product_id`, `product_version`), valid over `[valid_from_ts,
+  valid_to_ts)` as dated by the source. The current version runs to 9999-12-31.
+- Facts join to the version whose interval contains the event time (`fact_order_line` on
+  `event_ts_utc`, `fact_airtime_segment` on `start_ts_utc`). The singular test
+  `assert_order_lines_use_version_valid_at_event_time` checks every order line.
+- **`dbt/snapshots/dim_product_snapshot.sql`** is a capture-time audit trail: it snapshots
+  the current product row with the `check` strategy on `category`, `list_price_band`,
+  `list_price`, `brand` and `product_name`, and `hard_deletes='invalidate'`. Its versions are
+  dated by the run that saw the change, so it records what the warehouse knew and when. The
+  dimension does not read from it.
 
-- When a tracked attribute changes, the next snapshot run closes the old version
-  (`dbt_valid_to`) and opens a new one. Versions are effective from the run that captured the
-  change, so they follow processing time, not a source effective date.
-- `dim_product` builds one row per version with surrogate key (`product_id`, `dbt_valid_from`).
-  The first version of each product is widened back to 1900-01-01 so events before the first
-  snapshot still resolve; the current version runs to 9999-12-31.
-- Facts join to the version whose `[valid_from_ts, valid_to_ts)` contains the event time.
-
-`snowflake/demo_scd2.sql` walks through it: query product 1's versions, change its category
-and price in RAW, run `dbt run --select stg_products` and `dbt snapshot`, and query again to
-see the old version closed and a new current one opened.
+`snowflake/demo_scd2.sql` walks through the snapshot: query product 1's snapshot rows,
+change its category and price in RAW, run `dbt run --select stg_products` and
+`dbt snapshot`, and query again to see the old row closed and a new current one opened.
 
 Only product is SCD2; presenter and show are SCD1 (D4 in DECISIONS.md).
 
 ## 6. Attribution
 
-`int_orders_attributed_to_airtime` (ephemeral) tags each order line with a segment:
+`int_orders_attributed_to_airtime` (a view) tags each order line with a segment:
 
 1. **Candidates:** segments for the same product whose window
    `[start_ts_utc, end_ts_utc + attribution_lag_minutes)` contains `event_ts_utc`. The lag is a
-   dbt var (30) and must match `LAG_MINUTES` in the generator and the z-test.
+   dbt var (30) and must match `LAG_MINUTES` in the generator and `analysis/offline_rules.py`.
 2. **Tie-break:** latest start wins (last touch), then highest segment id.
 3. **No match:** `attributed_segment_id = -1`, `is_airtime_attributed = false` (organic).
 
-Two singular tests guard it: no order is attributed to a segment that started after it, and
-every attributed order falls inside its segment's window.
+The dbt unit test `attribution_window_boundaries_and_tie_break` (in `_intermediate.yml`)
+feeds seven hand-made order lines: before the start (organic), exactly at the start
+(attributed), inside two open windows (latest start wins), exactly at end + 30 (organic,
+twice), another product on air (organic), and the last second of the tail (attributed). Two
+singular tests also guard it on real data: no order is attributed to a segment that started
+after it, and every attributed order falls inside its segment's window.
+
+Against the generator's ground truth, the 30-minute window gives 96.3% precision and 87.7%
+recall on the sample batch. Recall is below 100% because the planted lag has a long tail
+(section 10).
 
 ## 7. Facts and dimensions
 
@@ -152,9 +205,13 @@ every attributed order falls inside its segment's window.
 | `fact_traffic` | one row per channel per minute | viewers and web sessions |
 | `dim_date` | one row per day | `dbt_utils.date_spine`, clipped to the dates in the data |
 | `dim_time_minute` | one row per minute of day (1,440) | daypart: morning 05-11, afternoon 12-17, prime time 18-22, late night otherwise |
-| `dim_product` | one row per product version | SCD2 (section 5) |
+| `dim_product` | one row per product version | event-time SCD2 (section 5) |
 | `dim_presenter`, `dim_show` | one row per id | SCD1 |
 | `dim_channel` | one row per channel | from the seed |
+
+Daypart and the prime-time flag are defined once in `dbt/macros/daypart.sql` (`daypart`,
+`is_prime_time`) and used by `dim_time_minute`, `fact_airtime_segment` and
+`mart_conversion_windows`. Prime time 18:00-22:59 UTC matches the generator.
 
 Product, presenter, show and channel have an unknown member (`-1`, `Unknown`) that orphan
 facts join to.
@@ -175,11 +232,17 @@ Three marts at three grains:
 | Mart | Grain | Purpose |
 |---|---|---|
 | `mart_kpi_metrics` | date × product × presenter × channel × attributed segment | additive base measures: GMV, discounts, returns refund, net revenue after returns, total net revenue, units sold, returned units, distinct orders, airtime-attributed revenue |
-| `mart_segment_performance` | one row per segment | attributed orders, units, revenue, and revenue per broadcast minute |
+| `mart_segment_performance` | one row per segment | attributed orders, units, revenue, revenue per broadcast minute, revenue per window minute |
 | `mart_conversion_windows` | airtime state × date × channel × daypart | online orders and web sessions on air vs off air |
 
 Ratios (AOV, return rate, attributed share) are computed in Power BI from the summed base
 measures, so they stay correct at any level of aggregation.
+
+**Segment revenue.** Attributed revenue covers the whole attribution window: the airtime plus
+the 30-minute tail. `revenue_per_broadcast_minute` = attributed revenue ÷ on-air minutes
+(`segment_duration_minutes`); `revenue_per_window_minute` = attributed revenue ÷ (on-air
+minutes + 30). The first is what a minute of airtime earns; the second spreads the same
+revenue over the window it was collected in.
 
 **Conversion definition.** Online channels only (Web Shop, Mobile App), for both orders and
 sessions. A minute is `on_air` if it falls inside any segment's window
@@ -193,10 +256,11 @@ exposure on the marts, facts and dimensions, so it appears in the `dbt docs` lin
 
 ## 9. Tests
 
-The project has 185 data tests across 24 models, 1 snapshot and 2 seeds (`dbt ls`).
+`dbt ls` counts 24 models, 190 data tests, 1 unit test, 1 snapshot and 2 seeds.
 
 - **Generic tests** in the YAML files: `unique`, `not_null`, `accepted_values`,
-  `relationships` and `dbt_utils` range checks, plus SCD2 version-key uniqueness.
+  `relationships` and `dbt_utils` range checks, plus uniqueness of the product version key.
+- **Unit test:** `attribution_window_boundaries_and_tie_break`, seven cases (section 6).
 - **Singular tests** in `dbt/tests/` (pass when they return no rows):
 
 | Test | Checks |
@@ -205,21 +269,39 @@ The project has 185 data tests across 24 models, 1 snapshot and 2 seeds (`dbt ls
 | `assert_attribution_within_lag_window` | every attributed order is inside `[start, end + lag)` |
 | `assert_return_rate_within_bounds` | returned quantity never exceeds sold quantity per line |
 | `assert_no_valid_row_has_null_keys` | no VARIANT row marked valid has missing or out-of-range fields |
+| `assert_no_overlapping_segments_per_channel` | no two segments on a channel overlap in `[start, end)` |
+| `assert_order_lines_use_version_valid_at_event_time` | every order line joins to the product version valid at its event time |
 
 `dbt build` runs models and their tests in DAG order; a failing test fails the build.
 
-## 10. Statistics
+**pytest** (`tests/`, 22 tests, `python -m pytest -q`): z-test values against hand-computed
+numbers, guards for untestable inputs and CI behaviour; generator determinism, no
+overlapping segments, show categories, dirty mode touching only the JSON feed, multi-line
+orders, version pricing, the truth file covering every line and never being loaded, the
+manifest's planted block, and id continuity across live batches; small null and recovery
+checks, attribution precision/recall and window behaviour, and the offline attribution rules.
+
+## 10. Statistics and validation
+
+`analysis/offline_rules.py` re-implements the dbt attribution and conversion rules on the
+generated CSVs, so the z-test and the validation run without Snowflake. It must be kept in
+sync with `int_orders_attributed_to_airtime` and `mart_conversion_windows`.
 
 `analysis/conversion_lift_test.py` runs a one-sided two-proportion z-test:
 H0 on-air conversion equals off-air, H1 on-air is higher. It uses only the standard library.
 
-- `--in generator/output` recomputes the counts from the CSVs with the same rules as the mart.
+- `--in generator/output` recomputes the counts from the CSVs with the offline rules.
 - `--from-snowflake` sums `marts.mart_conversion_windows` by state, connecting as
   `SNOWFLAKE_BI_ROLE` / `SNOWFLAKE_BI_WAREHOUSE` (default `ROLE_BI_READER` / `WH_BI`).
-- `--alpha` sets the significance level (default 0.05).
+- `--alpha` sets the significance level (default 0.05); CIs are at `1 − alpha`.
+- `--bootstrap-days REPS` adds a percentile CI for the relative lift from resampling whole
+  days (offline only), which relaxes the independent-sessions assumption.
 
-It prints both rates, absolute and relative lift, z and p. Sessions are treated as
-independent trials, so the result is a population-level lift, not a per-user causal effect.
+It prints both rates, the absolute lift (per 1,000 sessions) and relative lift with CIs
+(Wald for the difference, log ratio for the relative lift), z and p, and, on generated data,
+the planted lift from the manifest with whether it falls inside the CI. Sessions are treated
+as independent trials, so the result is a population-level lift, not a per-user causal
+effect.
 
 Reproducible result:
 
@@ -230,25 +312,43 @@ python analysis/conversion_lift_test.py --in generator/output
 
 | | Orders | Sessions | Conversion |
 |---|---|---|---|
-| On air | 4,653 | 18,222,830 | 0.026% |
-| Off air | 1,309 | 9,688,824 | 0.014% |
+| On air | 5,516 | 153,616 | 3.59% |
+| Off air | 1,256 | 79,193 | 1.59% |
 
-Relative lift +89.0%, z = 20.69, p ≈ 2e-95.
+Relative lift: planted +119.7%, measured +126.4% (95% CI +113.1% to +140.6%), z = 27.27.
+
+`analysis/validate_against_truth.py` compares measured against planted values:
+
+- `--in DIR`: parameter recovery table (lift, tier ratios, prime weight, channel order shares,
+  return rate per category, each with a 95% CI), attribution precision and recall against
+  the truth file, and a window sweep over 15, 30, 45, 60 and 90 minutes.
+- `--experiments` (with `--seeds N`, `--halo-seeds N`, `--days`): a null test with
+  `--onair-uplift 0`, a seed sweep with CI coverage, and a halo check.
+- `--markdown PATH` writes the results; `docs/VALIDATION.md` is produced with
+  `--experiments --seeds 50 --markdown docs/VALIDATION.md`.
+
+Summary (details in [docs/VALIDATION.md](docs/VALIDATION.md)): on the sample batch 13 of 14
+recovery checks fall inside their 95% CI (Beauty return rate is the miss; about 0.7 misses
+are expected by chance). Over 50 batches with no planted uplift, 4% are significant at
+α = 0.05. Over 50 seeds the CI covers the planted lift 98% of the time. Across halo values
+from 1.0 to 5.0 the measured lift tracks the planted one.
 
 ## 11. CI/CD
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`, one run at a time:
 
-- `parse` (always): `dbt parse` offline, then a 2-day generator run and the z-test.
+- `parse` (always): `dbt parse` offline, `python -m pytest -q`, then a 2-day generator run,
+  the z-test and `validate_against_truth.py` as a smoke test.
 - `check-secrets`: detects whether `SNOWFLAKE_ACCOUNT` is configured.
 - `build-and-test` (only with secrets): key-pair auth, load a 2-day batch into RAW with
   `--truncate`, `drop_ci_schemas`, `dbt build --target ci --full-refresh` into `_CI` schemas
   (`STAGING_CI`, `MARTS_CI`, `SNAPSHOTS_CI`, ...), `sqlfluff lint` (blocking), and
   `dbt source freshness` (report only).
 
-The profile target comes from `DBT_TARGET` (default `dev`, password auth; `ci` uses a private
-key). The CI user needs `ROLE_LOADER` and `ROLE_TRANSFORMER`. CI reloads the shared RAW
-schema, so it should point at its own database or account. Setup steps:
+Without secrets `build-and-test` is skipped, so the CI badge then covers the offline checks
+only. The profile target comes from `DBT_TARGET` (default `dev`, password auth; `ci` uses a
+private key). The CI user needs `ROLE_LOADER` and `ROLE_TRANSFORMER`. CI reloads the shared
+RAW schema, so it should point at its own database or account. Setup steps:
 [docs/CI_SETUP.md](docs/CI_SETUP.md).
 
 Locally, `.pre-commit-config.yaml` runs whitespace/YAML checks and `sqlfluff lint` with the
@@ -266,51 +366,57 @@ suspended and the Dynamic Table is suspended right after creation. See
 ## 13. Dashboard
 
 Four Power BI pages in Import mode, reading the marts only. The `.pbix` is not in the repo.
-Figures below come from the larger generated dataset behind the report, except the
-conversion figures, which are from the reproducible sample run in section 10.
+The report was built on an earlier version of the generator; it will be refreshed from a
+documented dataset (`python generator/generate_batch.py --out generator/output --days 90
+--seed 42`). No figures are quoted here until then.
+
+On generated data the pages show planted parameters coming back through the pipeline. They
+are a check on the pipeline, not business findings.
 
 **Overview** (slicer: month)
-- Cards: €260 revenue per broadcast minute, €50.68M net revenue after returns, €62.90M GMV,
-  12.91% return rate. The €12M gap between GMV and net is discounts and refunds.
-- Net revenue over time with airtime-attributed revenue as a band: about two-thirds of
-  revenue is airtime-attributed every month.
-- Revenue by channel: Web Shop 42.6%, Mobile App 29.6%, Call Centre 19.1%, TV Linear 8.7%.
-  TV triggers the demand; most orders land online.
+- Cards: revenue per broadcast minute, net revenue after returns, GMV, return rate.
+- Net revenue over time with airtime-attributed revenue as a band.
+- Revenue by channel. The order mix should match `planted.expected.channel_order_share` in
+  the manifest (about 41% Web Shop, 26% Mobile App, 25% Call Centre, 8% TV Linear on the
+  sample batch).
 - Top products by net revenue with their return rates alongside.
 
 **Airtime** (slicer: presenter experience tier)
-- €34M airtime-attributed revenue, 66.84% airtime share, 130.38K broadcast minutes.
-- Revenue by presenter, coloured by tier: the top Star presenters (€3.8-4.4M) lead the
-  Established ones (€3.0-3.5M).
-- Revenue per broadcast minute by daypart: prime time €316/min vs about €200/min in other
-  dayparts.
-- Category × presenter heatmap: presenters have distinct category strengths, which helps
-  decide who presents what.
+- Airtime-attributed revenue, airtime share and broadcast minutes.
+- Revenue by presenter, coloured by tier. Tier multipliers are planted at 1.6 (star),
+  1.25 (established) and 1.05 (rookie), so star presenters should earn more per broadcast
+  minute than established ones, and established more than rookies, after allowing for
+  product price and time slot.
+- Revenue per broadcast minute by daypart. The prime-time weight is planted at 1.6 and online
+  traffic is 2.1× in prime time, so prime time should lead.
+- Category × presenter heatmap. Each show draws from fixed categories and each airing has
+  one presenter, so a presenter's category mix reflects which shows they happened to host.
+  The generator plants no presenter-category effect.
 
 **Conversion** (on-air vs off-air split throughout)
-- On-air vs off-air conversion with the z-test result. On the sample run: 0.026% vs 0.014%,
-  +89.0% relative lift, p ≈ 2e-95.
+- On-air vs off-air conversion with the z-test result, next to the planted lift from the
+  manifest.
 - Conversion by daypart and by channel for each state.
 - Orders and web sessions by state, to show the lift is a rate change and not just more
   traffic.
 
 **Returns** (slicer: price band)
-- 12.91% return rate, €7.5M refunded, 93.94K units returned.
-- Return rate by category: Fashion 26.9% and Jewellery 22.2% vs Electronics 5.6% and
-  Wellness 6.7%.
-- Reasons: size/fit 40% and changed mind 25%; damaged and late delivery are minor.
-- Category × price band: Fashion returns run 24-30% in every band, highest at premium.
-
-Row-level security in the report restricts rows by role on top of the Snowflake grants.
+- Return rate, refunded value and units returned.
+- Return rate by category, which should sit near the planted rates: Fashion 28%,
+  Jewellery 24%, Beauty 10%, Home & Living 8%, Wellness 7%, Electronics 6%.
+- Reasons, which should follow the planted mix: size/fit 40%, changed mind 25%, not as
+  described 20%, damaged 10%, late delivery 5%.
+- Category × price band: premium and luxury bands are planted at 1.2× the category rate.
 
 ## 14. Status
 
-- Built and run end to end on Snowflake: setup, load (typed and VARIANT), dbt build with the
-  snapshot, attribution, facts, dimensions and marts.
-- SCD2 change capture shown with `snowflake/demo_scd2.sql`.
-- 185 data tests in the suite; CI as described in section 11.
+- An earlier version was built and run end to end on Snowflake in June 2026: setup, load
+  (typed and VARIANT), dbt build with the snapshot, attribution, facts, dimensions and marts,
+  CI, and the four-page Power BI report.
+- The current version is verified offline: `dbt parse` (24 models, 190 data tests, 1 unit
+  test, 1 snapshot, 2 seeds), 22 pytest tests and the validation harness. It has not yet been
+  re-run on Snowflake.
 - `dbt docs generate` lineage includes the dashboard exposure; view it with `dbt docs serve`.
-- Power BI report with four pages.
 
 Limitations and next steps: end of [DECISIONS.md](DECISIONS.md).
 
@@ -320,30 +426,35 @@ Limitations and next steps: end of [DECISIONS.md](DECISIONS.md).
 |---|---|
 | `README.md`, `PROJECT_GUIDE.md`, `DECISIONS.md` | Overview, this guide, design decisions |
 | `docs/KPI_CATALOG.md`, `docs/CI_SETUP.md` | KPI definitions; CI setup |
-| `requirements.txt` | numpy, snowflake-connector-python, dbt-snowflake ≥1.10, sqlfluff + dbt templater, python-dotenv |
+| `docs/VALIDATION.md` | Validation report, generated by `analysis/validate_against_truth.py` |
+| `requirements.txt` | numpy, snowflake-connector-python, dbt-snowflake ≥1.10 with dbt-core <1.13, sqlfluff + dbt templater, python-dotenv, pytest |
 | `.env.example`, `load_env.ps1` | Snowflake credential template; loads `.env` into PowerShell (bash: `set -a; source .env; set +a`) |
 | `.sqlfluff`, `.pre-commit-config.yaml` | Lint config; local hooks |
 | `.gitignore`, `.gitattributes` | Keeps secrets, keys, generated data and `.pbix` out; LF line endings |
-| `generator/generate_batch.py` | Synthetic batch generator, `--dirty` mode, manifest |
-| `generator/load_to_snowflake.py` | `PUT` + `COPY INTO` RAW; VARIANT load for JSON |
+| `generator/generate_batch.py` | Synthetic batch generator, planted parameters, manifest, truth file, `--dirty` mode |
+| `generator/load_to_snowflake.py` | `PUT` + `COPY INTO` RAW; VARIANT load for JSON; never loads `_truth_*` |
 | `generator/run_live.py` | Micro-batch loop, optional `dbt build` |
 | `snowflake/00_setup.sql` | Database, schemas, warehouses, roles, grants, stage, file formats |
-| `snowflake/demo_scd2.sql` | SCD2 change-capture walkthrough |
+| `snowflake/demo_scd2.sql` | Snapshot (audit trail) walkthrough |
 | `dbt/dbt_project.yml` | Schema routing, materialisations, vars `attribution_lag_minutes` (30) and `incremental_lookback_minutes` (120) |
 | `dbt/packages.yml`, `dbt/package-lock.yml` | `dbt_utils` |
 | `dbt/profiles.example.yml` | `dev` (password) and `ci` (key-pair) targets, chosen by `DBT_TARGET` |
 | `dbt/macros/generate_schema_name.sql` | Unprefixed schema names plus `DBT_SCHEMA_SUFFIX` |
 | `dbt/macros/surrogate_key.sql` | Wrapper over `dbt_utils.generate_surrogate_key` |
+| `dbt/macros/daypart.sql` | `daypart` and `is_prime_time`, defined once |
 | `dbt/macros/drop_ci_schemas.sql` | Drops `_CI` schemas; no-op outside the `ci` target |
 | `dbt/seeds/seed_channel.csv` | Channel reference data |
 | `dbt/seeds/category_return_baseline.csv` | Baseline return rate per category |
 | `dbt/models/staging/` | `_sources.yml`, `_staging.yml` and ten `stg_*` models |
-| `dbt/snapshots/dim_product_snapshot.sql` | Product SCD2 snapshot |
-| `dbt/models/intermediate/` | `int_orders_attributed_to_airtime` and its YAML |
+| `dbt/snapshots/dim_product_snapshot.sql` | Product snapshot (capture-time audit trail) |
+| `dbt/models/intermediate/` | `int_orders_attributed_to_airtime` and its YAML with the unit test |
 | `dbt/models/marts/dimensions/` | Six dimensions and `_dimensions.yml` |
 | `dbt/models/marts/facts/` | Four facts and `_facts.yml` |
 | `dbt/models/marts/` | Three metric marts, `_marts.yml`, `_exposures.yml` |
-| `dbt/tests/` | Four singular tests |
-| `analysis/conversion_lift_test.py` | Two-proportion z-test, offline or from Snowflake |
+| `dbt/tests/` | Six singular tests, including `assert_no_overlapping_segments_per_channel` and `assert_order_lines_use_version_valid_at_event_time` |
+| `analysis/offline_rules.py` | Offline copy of the dbt attribution and conversion rules |
+| `analysis/conversion_lift_test.py` | Two-proportion z-test with CIs and optional day bootstrap, offline or from Snowflake |
+| `analysis/validate_against_truth.py` | Parameter recovery, attribution vs truth, null test, seed sweep, halo check |
+| `tests/` | pytest suite: `conftest.py`, `test_generator.py`, `test_ztest.py`, `test_validation.py` |
 | `.github/workflows/ci.yml` | CI workflow |
 | `streaming/` | Streams + Tasks and Dynamic Table scripts, README |
