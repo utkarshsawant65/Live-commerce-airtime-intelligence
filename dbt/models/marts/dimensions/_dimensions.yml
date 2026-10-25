@@ -33,15 +33,17 @@ models:
 
   - name: dim_product
     description: >
-      One row per product version (SCD2) from dim_product_snapshot, plus the unknown member
-      (product_id = -1). Versions are effective from the snapshot run that captured the
-      change; the first version of each product starts at 1900-01-01.
+      One row per product version (SCD2 on the source's own validity dates), plus the
+      unknown member (product_id = -1). Facts join to the version valid at event time.
     columns:
       - name: product_key
-        description: Surrogate key per version (hash of product_id and dbt_valid_from).
+        description: Surrogate key per version (hash of product_id and product_version).
         data_tests: [not_null, unique]
       - name: product_id
         description: Natural key (not unique across versions).
+        data_tests: [not_null]
+      - name: product_version
+        description: Source version number, 1 = earliest; 0 for the unknown member.
         data_tests: [not_null]
       - name: category
         data_tests:

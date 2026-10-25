@@ -78,6 +78,16 @@ models:
                 min_value: 1
                 inclusive: true
       - name: revenue_per_broadcast_minute
+        description: >
+          Attributed revenue (airtime plus the 30-minute tail) divided by on-air minutes.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: revenue_per_window_minute
+        description: Attributed revenue divided by the full attribution window (on-air + tail minutes).
         data_tests:
           - not_null
           - dbt_utils.accepted_range:

@@ -4,7 +4,7 @@ models:
   - name: int_orders_attributed_to_airtime
     description: >
       One row per order line with the airtime segment it is attributed to (-1 = organic).
-      Ephemeral; feeds fact_order_line.
+      Feeds fact_order_line.
     columns:
       - name: order_line_id
         data_tests: [not_null, unique]
@@ -13,3 +13,34 @@ models:
         data_tests: [not_null]
       - name: is_airtime_attributed
         data_tests: [not_null]
+
+unit_tests:
+  - name: attribution_window_boundaries_and_tie_break
+    description: >
+      Hand-made rows, independent of the generator. Window is [start, end + 30 min);
+      the latest start wins when windows overlap; other products never match.
+    model: int_orders_attributed_to_airtime
+    given:
+      - input: ref('stg_airtime_segments')
+        rows:
+          - {segment_id: 1, product_id: 9, start_ts_utc: "2026-06-10 10:00:00", end_ts_utc: "2026-06-10 10:10:00"}
+          - {segment_id: 2, product_id: 9, start_ts_utc: "2026-06-10 10:20:00", end_ts_utc: "2026-06-10 10:25:00"}
+          - {segment_id: 3, product_id: 7, start_ts_utc: "2026-06-10 12:00:00", end_ts_utc: "2026-06-10 12:10:00"}
+      - input: ref('stg_order_lines')
+        rows:
+          - {order_line_id: 101, order_id: 1, product_id: 9, event_ts_utc: "2026-06-10 09:59:59"}
+          - {order_line_id: 102, order_id: 2, product_id: 9, event_ts_utc: "2026-06-10 10:00:00"}
+          - {order_line_id: 103, order_id: 3, product_id: 9, event_ts_utc: "2026-06-10 10:30:00"}
+          - {order_line_id: 104, order_id: 4, product_id: 9, event_ts_utc: "2026-06-10 10:55:00"}
+          - {order_line_id: 105, order_id: 5, product_id: 5, event_ts_utc: "2026-06-10 10:05:00"}
+          - {order_line_id: 106, order_id: 6, product_id: 7, event_ts_utc: "2026-06-10 12:39:59"}
+          - {order_line_id: 107, order_id: 7, product_id: 7, event_ts_utc: "2026-06-10 12:40:00"}
+    expect:
+      rows:
+        - {order_line_id: 101, attributed_segment_id: -1, is_airtime_attributed: false}  # before start
+        - {order_line_id: 102, attributed_segment_id: 1, is_airtime_attributed: true}    # at start
+        - {order_line_id: 103, attributed_segment_id: 2, is_airtime_attributed: true}    # both open, latest start
+        - {order_line_id: 104, attributed_segment_id: -1, is_airtime_attributed: false}  # exactly end + 30
+        - {order_line_id: 105, attributed_segment_id: -1, is_airtime_attributed: false}  # other product on air
+        - {order_line_id: 106, attributed_segment_id: 3, is_airtime_attributed: true}    # last second of tail
+        - {order_line_id: 107, attributed_segment_id: -1, is_airtime_attributed: false}  # exactly end + 30

@@ -47,13 +47,8 @@ select
     s.start_ts_utc,
     s.end_ts_utc,
     cast(s.start_ts_utc as date) as broadcast_date,
-    hour(s.start_ts_utc) between 18 and 22 as is_prime_time,
-    case
-        when hour(s.start_ts_utc) between 5 and 11 then 'morning'
-        when hour(s.start_ts_utc) between 12 and 17 then 'afternoon'
-        when hour(s.start_ts_utc) between 18 and 22 then 'prime_time'
-        else 'late_night'
-    end as daypart,
+    {{ is_prime_time('hour(s.start_ts_utc)') }} as is_prime_time,
+    {{ daypart('hour(s.start_ts_utc)') }} as daypart,
     s.segment_duration_minutes
 from segments as s
 left join dim_product_pit as p
